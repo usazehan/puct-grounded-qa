@@ -31,19 +31,29 @@ class ExtractionStatus(str, Enum):
     EXCLUDED_PII = "excluded_pii"
 
 
-# Every page of a filed document carries a Bates stamp (0000001, 0000002, ...).
-# It is unique, monotonic across the whole filing, and it is what a lawyer
-# actually cites -- "at 0000004", not "page 4 of the PDF". It is therefore the
-# citation anchor, not the PDF page index.
+# CITATION ANCHOR HIERARCHY
 #
-# The PDF page index is wrong twice over: it counts the barcode cover sheet and
-# the file-stamped title page, and the document's own internal labels restart at
-# attachments ("Page 1 of 9" ... then "Page 1 of 3").
+# Filings do not label pages consistently. Measured across docket 49421:
+#   item 788 (Staff testimony)  -> Bates stamped 0000001..0000013
+#   item 786 (Colvin testimony) -> no Bates at all; internal "Page 3 of 13"
+#
+# So the anchor is resolved in order of authority, and which scheme was used is
+# recorded, because a citation must be honest about what it is pointing at:
+#   1. BATES    -- the record stamp; unique and monotonic across a filing
+#   2. LABEL    -- the document's own "Page N of M" header
+#   3. PDF_PAGE -- physical page, minus any cover sheet; weakest, always flagged
 BATES_RE = re.compile(r"\b(0{4,6}\d{1,4})\b")
+PAGE_LABEL_RE = re.compile(r"\bPage\s+(\d+)\s+of\s+(\d+)\b", re.IGNORECASE)
 
 # The Interchange prepends a machine-readable cover sheet to filings. It OCRs to
 # barcode noise and carries no citable content.
 COVER_SHEET_MARKERS = ("Control Number:", "Item Number:", "Addendum StartPage")
+
+
+class AnchorScheme(str, Enum):
+    BATES = "bates"
+    PAGE_LABEL = "page_label"
+    PDF_PAGE = "pdf_page"
 
 
 @dataclass
@@ -53,8 +63,26 @@ class PageSpan:
     page_number: int  # 1-indexed position within this PDF
     char_start: int
     char_end: int
-    bates: str | None = None  # citation anchor, when stamped
+    bates: str | None = None
+    page_label: str | None = None  # "3 of 13", from the document's own header
     is_cover_sheet: bool = False
+
+    @property
+    def anchor_scheme(self) -> AnchorScheme:
+        if self.bates:
+            return AnchorScheme.BATES
+        if self.page_label:
+            return AnchorScheme.PAGE_LABEL
+        return AnchorScheme.PDF_PAGE
+
+    @property
+    def citation(self) -> str:
+        """Human-readable anchor for this page, as it would appear in a citation."""
+        if self.bates:
+            return f"Bates {self.bates}"
+        if self.page_label:
+            return f"p. {self.page_label}"
+        return f"PDF page {self.page_number}"
 
 
 @dataclass
@@ -77,14 +105,26 @@ class ExtractedDocument:
         raise IndexError(f"Offset {offset} outside document of length {len(self.text)}")
 
     def bates_for_offset(self, offset: int) -> str | None:
-        """Bates stamp for a character offset -- the citation anchor.
+        """Bates stamp for an offset, or None if this filing is not stamped."""
+        return self.pages[self.page_for_offset(offset) - 1].bates
 
-        Returns None for unstamped pages (cover sheets, occasional OCR misses).
-        A citation with no Bates should fall back to the filing page number and
-        be flagged, not silently emitted.
+    def anchor_for_offset(self, offset: int) -> tuple[str, AnchorScheme]:
+        """Citation anchor for an offset, plus which scheme produced it.
+
+        Callers should surface the scheme. A PDF_PAGE anchor is materially
+        weaker than a BATES one -- it is a position in a file, not a position in
+        the record -- and a citation that cannot say which it is has no business
+        claiming to be verifiable.
         """
-        page = self.page_for_offset(offset)
-        return self.pages[page - 1].bates
+        span = self.pages[self.page_for_offset(offset) - 1]
+        return span.citation, span.anchor_scheme
+
+    def anchor_coverage(self) -> dict[str, int]:
+        """Count citable pages by anchor scheme. Report this per document."""
+        counts = {s.value: 0 for s in AnchorScheme}
+        for span in self.citable_pages():
+            counts[span.anchor_scheme.value] += 1
+        return counts
 
     def citable_pages(self) -> list[PageSpan]:
         """Pages worth indexing: excludes the Interchange barcode cover sheet."""
@@ -152,6 +192,7 @@ def extract_document(
                 page_text += "\n"
             parts.append(page_text)
             bates_matches = BATES_RE.findall(page_text)
+            label_match = PAGE_LABEL_RE.search(page_text)
             pages.append(
                 PageSpan(
                     page_number=index,
@@ -160,6 +201,11 @@ def extract_document(
                     # The stamp sits in the page footer; take the last match so a
                     # docket or exhibit number earlier in the body cannot win.
                     bates=bates_matches[-1] if bates_matches else None,
+                    page_label=(
+                        f"{label_match.group(1)} of {label_match.group(2)}"
+                        if label_match
+                        else None
+                    ),
                     is_cover_sheet=sum(m in page_text for m in COVER_SHEET_MARKERS) >= 2,
                 )
             )

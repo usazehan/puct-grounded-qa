@@ -42,6 +42,20 @@ WORD_RE = re.compile(r"[A-Za-z]{3,}")
 NUM_RE = re.compile(r"\$?\d[\d,]*\.?\d*%?")
 
 
+def read_native(path: Path) -> str:
+    """Read a native file. ZIPs contain .docx, .pdf, and .xlsx workpapers.
+
+    Measured in docket 49421: item 788's native file was .docx, item 786's was a
+    born-digital .pdf. Handle both; spreadsheets are skipped (out of scope for
+    the text index, though they are excellent ground truth for eval labels).
+    """
+    if path.suffix.lower() == ".pdf":
+        from puctqa.extract import extract_document
+
+        return extract_document(path.read_bytes()).text
+    return read_docx(path)
+
+
 def read_docx(path: Path) -> str:
     try:
         import docx  # python-docx
@@ -65,10 +79,19 @@ def numeric_tokens(text: str, min_len: int = 4) -> set[str]:
 
 def find_native(native_dir: Path, ref: DocumentRef) -> Path | None:
     prefix = f"{ref.control_number}_{ref.item_number}_"
-    for path in native_dir.rglob("*.docx"):
-        if path.name.startswith("~$"):  # Word lock file
-            continue
-        if prefix in path.name or ref.control_number in path.name:
+    candidates = [
+        p
+        for p in native_dir.rglob("*")
+        if p.suffix.lower() in {".docx", ".pdf"} and not p.name.startswith("~$")
+    ]
+    for path in candidates:
+        # Filename carries the item number: 49421_786_1049723.pdf
+        if prefix in path.name:
+            return path
+        # Or the ZIP was extracted into a per-item directory. ZIP contents are
+        # named descriptively ("49421 Colvin Stipulation Support Testimony.pdf"),
+        # so the directory is the only reliable link back to an item.
+        if any(prefix.rstrip("_") == part or prefix in part for part in path.parts[:-1]):
             return path
     return None
 
@@ -92,7 +115,14 @@ def main() -> int:
 
     if not pairs:
         print(f"No PDF/native pairs found between {args.pdf_dir} and {args.native_dir}")
-        print("Download the 'Native Files (Zip)' for a few items and extract the .docx.")
+        print()
+        print("Native files must be linkable to an item number. Extract each ZIP")
+        print("into its own directory named for the item:")
+        print("    data/native/49421_786/...")
+        print("    data/native/49421_788/...")
+        print("Matching on control number alone is NOT done: it silently pairs the")
+        print("wrong documents and produces plausible-looking but meaningless")
+        print("accuracy numbers.")
         return 1
 
     print(f"{'document':<30} {'words':>7} {'word acc':>9} {'nums':>6} {'num acc':>8}")
@@ -101,10 +131,11 @@ def main() -> int:
     total_words = total_words_ok = 0
     total_nums = total_nums_ok = 0
     all_errors: list[tuple[str, str]] = []
+    anchor_summaries: list[tuple[str, dict[str, int]]] = []
 
     for pdf_path, native_path in pairs:
         ocr_text = extract_document(pdf_path.read_bytes()).text
-        native_text = read_docx(native_path)
+        native_text = read_native(native_path)
 
         nw, ow = word_types(native_text), word_types(ocr_text)
         missing_words = nw - ow
@@ -126,6 +157,9 @@ def main() -> int:
             f"{pdf_path.name[:29]:<30} {len(nw):>7} {w_acc:>8.1f}% "
             f"{len(nn):>6} {n_acc:>7.1f}%"
         )
+        anchor_summaries.append(
+            (pdf_path.name, extract_document(pdf_path.read_bytes()).anchor_coverage())
+        )
 
     w_overall = total_words_ok / total_words * 100 if total_words else 0.0
     n_overall = total_nums_ok / total_nums * 100 if total_nums else 0.0
@@ -145,6 +179,21 @@ def main() -> int:
 
     if w_overall < 100.0:
         print("Prose shows OCR errors -> span verification must be fuzzy, not exact.")
+
+    if anchor_summaries:
+        print("Citation anchor coverage (pages by scheme):")
+        for name, counts in anchor_summaries:
+            print(
+                f"  {name[:30]:<31} bates={counts['bates']:>3} "
+                f"label={counts['page_label']:>3} pdf_page={counts['pdf_page']:>3}"
+            )
+        weak = sum(c["pdf_page"] for _, c in anchor_summaries)
+        if weak:
+            print(
+                f"\n  {weak} page(s) fall back to PDF page numbering. Citations to"
+                "\n  those pages must be flagged as weakly anchored."
+            )
+        print()
 
     if args.show_errors and all_errors:
         print(f"\nWords present in native text but absent from OCR ({len(all_errors)}):")

@@ -66,14 +66,18 @@ make probe DIR=data/raw
 
 ## Measured findings
 
-Verified against a real filing (49421-788, Staff testimony supporting the
-stipulation) with its native `.docx` as ground truth:
+Verified against two real filings in docket 49421 — item 788 (Staff testimony,
+native `.docx`) and item 786 (CenterPoint testimony, born-digital native `.pdf`
+from the Native Files ZIP) — using the native file as ground truth:
 
 | Measurement | Result | Consequence |
 |---|---|---|
-| Text-layer coverage | 14/14 pages, 1991 chars/page | Usable without OCR work |
-| Word-type accuracy | 99.9% (722/723) | Span matching must be **fuzzy** |
-| Numeric-token accuracy | **100% (106/106)** | Numeric matching can be **exact** |
+| Text-layer coverage | 100% of pages across both filings | Usable without OCR work |
+| Word-type accuracy | 99.9% (item 788), 100% (item 786) | Span matching must be **fuzzy** |
+| Numeric-token accuracy | **100% on both (142/142)** | Numeric matching can be **exact** |
+
+OCR quality varies by scan — 788 shows `rn`→`m` errors, 786 is clean — so the
+measurement is per-document, not a single corpus-wide claim.
 
 PUCT serves scanned filings that PUCT has already OCR'd. The OCR degrades prose
 ligatures (`amount` → `arnount`, `O&M` → `08tM`) and leaves digits untouched.
@@ -84,13 +88,22 @@ exactly — a measured decision, not a guess.
 python scripts/ocr_accuracy.py data/raw data/native --show-errors
 ```
 
-### Citations anchor to Bates stamps
+### Citation anchors resolve by hierarchy
 
-Not PDF page numbers. In that same document, PDF page 1 is the barcode cover
-sheet, page 2 is the file-stamped title page, and the internal labels restart at
-the attachment ("Page 1 of 9" ... then "Page 1 of 3"). Only the Bates stamp is
-unique and monotonic across a filing — and "at 0000004" is what a lawyer citing
-the record actually writes.
+PDF page numbers are not citable: page 1 is the Interchange barcode cover sheet,
+and internal labels restart at attachments. But no single alternative is
+universal either — measured across two filings in the same docket:
+
+| Item | Bates | Page label | Falls back to PDF page |
+|---|---|---|---|
+| 788 (Staff testimony) | 12 pages | — | 1 |
+| 786 (Colvin testimony) | none | 11 pages | 3 |
+
+So anchors resolve in order of authority — Bates, then the document's own
+"Page N of M" header, then PDF page — and **the scheme is recorded alongside the
+citation**. A PDF-page anchor is a position in a file, not a position in the
+record; a citation that can't say which it is has no business claiming to be
+verifiable.
 
 ---
 

@@ -288,3 +288,47 @@ def test_interchange_cover_sheet_detected_and_excluded():
 def test_ordinary_page_not_mistaken_for_cover_sheet():
     extracted = extract_document(make_pdf(["Control Number: 49421 appears in a heading"]))
     assert extracted.pages[0].is_cover_sheet is False
+
+
+# --------------------------------------------------------------------------
+# Citation anchor hierarchy
+#
+# Measured in docket 49421: item 788 is Bates stamped, item 786 is not but
+# carries "Page N of 13" headers. Neither scheme is universal, so the anchor
+# resolves in order of authority and records which scheme produced it.
+# --------------------------------------------------------------------------
+
+
+def test_bates_wins_when_present():
+    from puctqa.extract import AnchorScheme
+
+    extracted = extract_document(make_pdf(["Page 3 of 13\nbody text\n0000004"]))
+    citation, scheme = extracted.anchor_for_offset(extracted.text.index("body"))
+    assert scheme is AnchorScheme.BATES
+    assert citation == "Bates 0000004"
+
+
+def test_page_label_used_when_no_bates():
+    from puctqa.extract import AnchorScheme
+
+    extracted = extract_document(make_pdf(["Page 6 of 13\nthe ROE is 9.4 percent"]))
+    citation, scheme = extracted.anchor_for_offset(extracted.text.index("9.4"))
+    assert scheme is AnchorScheme.PAGE_LABEL
+    assert citation == "p. 6 of 13"
+
+
+def test_pdf_page_is_last_resort_and_identifiable():
+    from puctqa.extract import AnchorScheme
+
+    extracted = extract_document(make_pdf(["unlabelled body text"]))
+    citation, scheme = extracted.anchor_for_offset(0)
+    assert scheme is AnchorScheme.PDF_PAGE
+    assert citation == "PDF page 1"
+
+
+def test_anchor_coverage_counts_by_scheme_excluding_cover():
+    cover = "Control Number: 49421\nItem Number: 786\nAddendum StartPage: 0"
+    extracted = extract_document(
+        make_pdf([cover, "Page 1 of 2\nalpha", "Page 2 of 2\nbeta\n0000003", "unlabelled"])
+    )
+    assert extracted.anchor_coverage() == {"bates": 1, "page_label": 1, "pdf_page": 1}
