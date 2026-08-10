@@ -202,28 +202,19 @@ def test_http_source_refuses_when_disabled():
 # --------------------------------------------------------------------------
 
 
-def test_parse_page_offset_from_description():
-    from puctqa.sources import parse_page_offset
+def test_parse_page_range_reads_the_claim():
+    from puctqa.sources import parse_page_range
 
-    assert parse_page_offset("Pages 1 to 100") == 0
-    assert parse_page_offset("Pages 101 to 200") == 100
-    assert parse_page_offset("Pages 901 to 1000") == 900
-    assert parse_page_offset("Pages 101-200") == 100
+    assert parse_page_range("Pages 101 to 200") == (101, 200)
+    assert parse_page_range("Pages 101-200") == (101, 200)
 
 
-def test_parse_page_offset_defaults_to_zero():
-    from puctqa.sources import parse_page_offset
+def test_parse_page_range_returns_none_when_absent():
+    from puctqa.sources import parse_page_range
 
-    assert parse_page_offset(None) == 0
-    assert parse_page_offset("Native Files (Zip)") == 0
-    assert parse_page_offset("Direct Testimony of Jane Doe") == 0
-
-
-def test_filing_page_accounts_for_fragment_offset():
-    extracted = extract_document(make_pdf(["alpha", "beta", "gamma"]), page_offset=100)
-    offset = extracted.text.index("gamma")
-    assert extracted.page_for_offset(offset) == 3        # page within the PDF
-    assert extracted.filing_page_for_offset(offset) == 103  # page within the filing
+    assert parse_page_range(None) is None
+    assert parse_page_range("Native Files (Zip)") is None
+    assert parse_page_range("Direct Testimony of Jane Doe") is None
 
 
 def test_unsplit_document_reports_identical_pages():
@@ -232,10 +223,31 @@ def test_unsplit_document_reports_identical_pages():
     assert extracted.page_for_offset(offset) == extracted.filing_page_for_offset(offset)
 
 
-def test_local_source_derives_offset_from_manifest_description(tmp_path: Path):
+def test_local_source_ignores_the_page_range_description(tmp_path: Path):
+    """Item 795 serves two documents both claiming "Pages 101 to 200" that begin
+    at different content. A description is a claim about a file, not a fact
+    about it, and trusting it displaces every citation from that document."""
     (tmp_path / "49421_1_1013635.PDF").write_bytes(make_pdf(["fragment"]))
     (tmp_path / "manifest.json").write_text(
         json.dumps([{"filename": "49421_1_1013635.PDF", "description": "Pages 101 to 200"}])
+    )
+    ref = LocalFolderSource(tmp_path).list_documents("49421")[0]
+    assert ref.page_offset == 0
+
+
+def test_local_source_uses_an_explicitly_asserted_offset(tmp_path: Path):
+    """A human who checked the document can still assert one."""
+    (tmp_path / "49421_1_1013635.PDF").write_bytes(make_pdf(["fragment"]))
+    (tmp_path / "manifest.json").write_text(
+        json.dumps(
+            [
+                {
+                    "filename": "49421_1_1013635.PDF",
+                    "description": "Pages 101 to 200",
+                    "page_offset": 100,
+                }
+            ]
+        )
     )
     ref = LocalFolderSource(tmp_path).list_documents("49421")[0]
     assert ref.page_offset == 100

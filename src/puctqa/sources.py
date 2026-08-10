@@ -27,24 +27,37 @@ FILENAME_RE = re.compile(
 )
 
 
-# Large filings are split into ~100-page PDFs whose description carries the true
-# page range: "Pages 101 to 200". The first page of that PDF is page 101 of the
-# filing, so citations must add an offset or they will silently be wrong.
+# Large filings are split into ~100-page PDFs whose description carries a page
+# range: "Pages 101 to 200".
+#
+# That description is NOT used to derive a page offset, and this is deliberate.
+# Item 795 serves two documents both described "Pages 101 to 200" that begin at
+# different content, so the description is a claim the Interchange makes about a
+# file rather than a fact about the file. Trusting it displaces every citation
+# from that document by an unknown amount, and it fails silently:
+# verify_offset_integrity() checks that page spans tile the extracted text, which
+# is internal consistency and cannot detect that page 1 of the file is not page
+# 101 of the record.
+#
+# A page offset must therefore be asserted explicitly in the manifest, by a human
+# who checked. With no offset, page_offset stays 0 and citations resolve against
+# the PDF -- a position in a file, honestly labelled as such, rather than a
+# position in the record that the file cannot support.
 PAGE_RANGE_RE = re.compile(r"pages?\s+(?P<start>\d+)\s*(?:to|-|–)\s*(?P<end>\d+)", re.IGNORECASE)
 
 
-def parse_page_offset(description: str | None) -> int:
-    """Return the 0-based offset to add to in-PDF page numbers.
+def parse_page_range(description: str | None) -> tuple[int, int] | None:
+    """The page range a description claims, or None.
 
-    "Pages 101 to 200" -> 100, so in-PDF page 1 reports as filing page 101.
-    Anything unparseable returns 0, meaning the PDF stands alone.
+    Used for grouping and reporting only. Never for citation offsets: see the
+    note above.
     """
     if not description:
-        return 0
+        return None
     m = PAGE_RANGE_RE.search(description)
     if not m:
-        return 0
-    return int(m["start"]) - 1
+        return None
+    return int(m["start"]), int(m["end"])
 
 
 @dataclass(frozen=True)
@@ -124,11 +137,9 @@ class LocalFolderSource:
                 continue
             meta = self._manifest.get(path.name, {})
             description = meta.get("description")
-            # Explicit manifest offset wins; otherwise derive it from the
-            # "Pages 101 to 200" description the Interchange provides.
-            offset = meta.get("page_offset")
-            if offset is None:
-                offset = parse_page_offset(description)
+            # Explicit assertion only. An absent offset means the document
+            # stands alone and cites by PDF page.
+            offset = meta.get("page_offset") or 0
             refs.append(
                 DocumentRef(
                     control_number=ref.control_number,

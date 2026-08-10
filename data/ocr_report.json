@@ -1,0 +1,114 @@
+{
+  "documents": [
+    {
+      "document": "49421_773_1043164.pdf",
+      "parts": [
+        "49421_773_1043164.pdf"
+      ],
+      "containment": 23.551,
+      "native": "Final Order number running memo - Murphy.docx",
+      "native_coverage": {
+        "Final Order number running memo - Murphy.docx": 23.6,
+        "49421--Number Run memo per CADM instructions.docx": 18.2,
+        "49421 - Commission Number Run - Staff Accounting Memorandum 12-4-2019.docx": 17.8,
+        "49421 - Final Order Number Run - Attachment B.1 - Functionalization Summary.pdf": 7.6,
+        "49421 - Final Order Number Run - Attachment B.2 - Wholesale TCOS.pdf": 7.6,
+        "49421 - Final Order Number Run - Attachment D - Rate Design Summary.pdf": 5.9,
+        "49421 - Final Order Number Run - Attachment C.3 - Class ERCOT Transmission Payment Responsibilities.pdf": 5.5,
+        "49421 - Final Order Number Run - Attachment B.3 - CCOSS Summary.pdf": 5.2,
+        "49421 - Final Order Number Run - Attachment C.2 - Class Revenue Distribution.pdf": 5.2,
+        "49421 - Final Order Number Run - Attachment C.1 - Base Revenue Summary.pdf": 4.3,
+        "49421 - Commission Number Run - Staff Accounting Memorandum and Attachments 12-4-2019.pdf": 0.0
+      },
+      "native_kind": "docx",
+      "native_bundle": [
+        "49421 - Acct Rev Req Model - PUC Number Run - 12-4-2019.xlsx",
+        "49421 - Model of CEHE's CCOSS - Final Order.xlsm"
+      ],
+      "folded_workpapers": {
+        "49421 - Acct Rev Req Model - PUC Number Run - 12-4-2019.xlsx": {
+          "pairs": 4982,
+          "served_values_covered": 49.1
+        },
+        "_not_folded": {
+          "reason": "competing label vocabulary for the same rows",
+          "files": [
+            "49421 - Model of CEHE's CCOSS - Final Order.xlsm"
+          ]
+        }
+      },
+      "word_type_accuracy": 100.0,
+      "numeric_occurrence_accuracy": 100.0,
+      "numeric_type_accuracy": 100.0,
+      "numeric_occurrences": 24,
+      "short_token_accuracy": 100.0,
+      "short_tokens": 13,
+      "sign_losses": 0,
+      "association_rate": 77.361,
+      "association_pairs_measured": 720,
+      "association_pairs_unlocatable": 161,
+      "association_pairs_ambiguous": 4101,
+      "verdict": "exact_structure_reported",
+      "verdict_note": "digits intact; row association measured as a lower bound and reported, not gated -- see association_rate",
+      "numeric_verifiable": true
+    },
+    {
+      "document": "49421_795 [1057872..1057875]",
+      "parts": [
+        "49421_795_1057872.pdf",
+        "49421_795_1057873.pdf",
+        "49421_795_1057874.pdf",
+        "49421_795_1057875.pdf"
+      ],
+      "containment": 95.42,
+      "native": "D49421 - Tariff Filing of CEHE In Compliance with the Final Order in Docket No. 49421.pdf",
+      "native_coverage": {},
+      "native_kind": "pdf",
+      "native_bundle": [],
+      "folded_workpapers": {},
+      "word_type_accuracy": 99.826,
+      "numeric_occurrence_accuracy": 99.381,
+      "numeric_type_accuracy": 99.482,
+      "numeric_occurrences": 8081,
+      "short_token_accuracy": 99.337,
+      "short_tokens": 6934,
+      "sign_losses": 1,
+      "association_rate": null,
+      "association_pairs_measured": 0,
+      "association_pairs_unlocatable": 0,
+      "association_pairs_ambiguous": 0,
+      "verdict": "exact_unverified_structure",
+      "verdict_note": "digits intact; native format carries no table structure, association unmeasured",
+      "numeric_verifiable": true
+    },
+    {
+      "document": "49421_795 [1119824..1119827]",
+      "parts": [
+        "49421_795_1119824.pdf",
+        "49421_795_1119825.pdf",
+        "49421_795_1119826.pdf",
+        "49421_795_1119827.pdf"
+      ],
+      "containment": 88.379,
+      "native": "D49421 - Tariff Filing of CEHE In Compliance with the Final Order in Docket No. 49421.pdf",
+      "native_coverage": {},
+      "native_kind": "pdf",
+      "native_bundle": [],
+      "folded_workpapers": {},
+      "word_type_accuracy": 99.593,
+      "numeric_occurrence_accuracy": 97.933,
+      "numeric_type_accuracy": 98.756,
+      "numeric_occurrences": 8081,
+      "short_token_accuracy": 98.817,
+      "short_tokens": 6934,
+      "sign_losses": 1,
+      "association_rate": null,
+      "association_pairs_measured": 0,
+      "association_pairs_unlocatable": 0,
+      "association_pairs_ambiguous": 0,
+      "verdict": "refuse_numerics",
+      "verdict_note": "extraction failed systemically -- numeric claims citing this document should be refused by policy, not left to per-claim verification",
+      "numeric_verifiable": false
+    }
+  ]
+}

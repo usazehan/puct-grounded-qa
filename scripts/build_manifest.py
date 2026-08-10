@@ -136,6 +136,12 @@ def main() -> int:
             item = int(row["Item #"])
             entries.append(
                 {
+                    # page_offset is null until a human reads the document and
+                    # asserts it. The Interchange page-range description is not
+                    # used to derive one -- item 795 serves two documents both
+                    # described "Pages 101 to 200" that start at different
+                    # content, so the description cannot be trusted as a fact.
+                    "page_offset": None,
                     # filename is filled in after download; document IDs are only
                     # visible on the item page, not in the export.
                     "filename": None,
@@ -151,6 +157,8 @@ def main() -> int:
         args.out.write_text(json.dumps(entries, indent=2))
         print(f"\nWrote {len(entries)} manifest entries to {args.out}")
         print("Fill in 'filename' and 'description' as you download each document.")
+        print("Leave 'page_offset' null unless you have read the document and")
+        print("confirmed where it starts; citations fall back to PDF page.")
 
     return 0
 
