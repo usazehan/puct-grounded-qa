@@ -344,3 +344,104 @@ def test_anchor_coverage_counts_by_scheme_excluding_cover():
         make_pdf([cover, "Page 1 of 2\nalpha", "Page 2 of 2\nbeta\n0000003", "unlabelled"])
     )
     assert extracted.anchor_coverage() == {"bates": 1, "page_label": 1, "pdf_page": 1}
+
+def test_manifest_may_be_nested_by_item_and_set(tmp_path: Path):
+    """Item 795 is a 371-page tariff served as four parts, twice over.
+
+    A flat entry with one `filename` cannot hold that, so the generated manifest
+    nests item -> set -> documents and metadata merges down onto each document.
+    """
+    from puctqa.sources import LocalFolderSource
+
+    for name in ("49421_795_1057872.PDF", "49421_795_1057873.PDF"):
+        (tmp_path / name).write_bytes(make_pdf(["part"]))
+    (tmp_path / "manifest.json").write_text(
+        json.dumps(
+            {
+                "control_number": "49421",
+                "items": [
+                    {
+                        "item_number": 795,
+                        "filing_party": "CENTERPOINT ENERGY HOUSTON ELECTRIC , LLC",
+                        "sets": [
+                            {
+                                "set_id": "49421_795_a",
+                                "status": "superseded",
+                                "retrieval_eligible": False,
+                                "documents": [
+                                    {"filename": "49421_795_1057872.PDF", "page_offset": 0},
+                                    {
+                                        "filename": "49421_795_1057873.PDF",
+                                        "page_offset": 100,
+                                    },
+                                ],
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+    )
+
+    refs = {r.filename: r for r in LocalFolderSource(tmp_path).list_documents("49421")}
+    assert refs["49421_795_1057873.PDF"].page_offset == 100
+    assert all(r.set_id == "49421_795_a" for r in refs.values())
+    assert not any(r.retrieval_eligible for r in refs.values())
+
+
+def test_flat_manifest_still_reads(tmp_path: Path):
+    """A hand-written flat list stays valid for the single-document case."""
+    from puctqa.sources import LocalFolderSource
+
+    (tmp_path / "49421_1_1013635.PDF").write_bytes(make_pdf(["fragment"]))
+    (tmp_path / "manifest.json").write_text(
+        json.dumps([{"filename": "49421_1_1013635.PDF", "description": "Application"}])
+    )
+    ref = LocalFolderSource(tmp_path).list_documents("49421")[0]
+    assert ref.description == "Application"
+    assert ref.set_id is None
+    assert ref.retrieval_eligible
+
+
+def test_parts_group_into_sets_by_document_id_run():
+    from puctqa.sources import DocumentRef, group_document_sets
+
+    refs = [
+        DocumentRef.from_filename(f"49421_795_{d}.pdf")
+        for d in ("1057872", "1057873", "1119824", "1119825")
+    ] + [DocumentRef.from_filename("49421_773_1043164.pdf")]
+
+    sets = group_document_sets(refs)
+    assert sorted(sets) == ["49421_773", "49421_795_a", "49421_795_b"]
+    assert len(sets["49421_795_a"]) == 2
+
+
+def test_unfilled_set_fields_do_not_erase_item_metadata(tmp_path: Path):
+    """A set carries its own selection_note; leaving it null must not overwrite
+    the item's, which records why the document is in the corpus at all."""
+    from puctqa.sources import LocalFolderSource
+
+    (tmp_path / "49421_773_1043164.PDF").write_bytes(make_pdf(["memo"]))
+    (tmp_path / "manifest.json").write_text(
+        json.dumps(
+            {
+                "items": [
+                    {
+                        "item_number": 773,
+                        "selection_note": "Commission number run memo. Tables.",
+                        "sets": [
+                            {
+                                "set_id": "49421_773",
+                                "selection_note": None,
+                                "documents": [{"filename": "49421_773_1043164.PDF"}],
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+    )
+
+    source = LocalFolderSource(tmp_path)
+    ref = source.list_documents("49421")[0]
+    assert source.metadata(ref)["selection_note"] == "Commission number run memo. Tables."

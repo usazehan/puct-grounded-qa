@@ -71,6 +71,10 @@ class DocumentRef:
     filename: str | None = None
     description: str | None = None
     page_offset: int = 0  # added to in-PDF page numbers to get true filing pages
+    # A filing served in parts belongs to a set; the set is what carries
+    # extraction verdicts, because those are measured across the whole filing.
+    set_id: str | None = None
+    retrieval_eligible: bool = True
 
     @property
     def natural_key(self) -> tuple[str, int, str]:
@@ -91,6 +95,39 @@ class DocumentRef:
             source_url=source_url,
             filename=Path(name).name,
         )
+
+
+# Document IDs within one set run consecutively (item 795 set A is
+# 1057872-1057875); a refiled set lands in a much later batch (1119824-1119827).
+# Page-range descriptions are NOT used to group -- 795 serves two documents both
+# described "Pages 101 to 200".
+SET_ID_GAP = 32
+
+
+def group_document_sets(refs: list[DocumentRef]) -> dict[str, list[DocumentRef]]:
+    """Group an item's documents into sets by document-ID run.
+
+    Item 795 serves a 371-page tariff as four ~100-page PDFs, twice over. The
+    parts are one filing; comparing or citing them individually treats a quarter
+    of a document as a document.
+    """
+    by_item: dict[tuple[str, int], list[DocumentRef]] = {}
+    for ref in refs:
+        by_item.setdefault((ref.control_number, ref.item_number), []).append(ref)
+
+    sets: dict[str, list[DocumentRef]] = {}
+    for (control, item), entries in sorted(by_item.items()):
+        entries.sort(key=lambda r: int(r.document_id))
+        runs: list[list[DocumentRef]] = [[entries[0]]]
+        for ref in entries[1:]:
+            if int(ref.document_id) - int(runs[-1][-1].document_id) > SET_ID_GAP:
+                runs.append([])
+            runs[-1].append(ref)
+        for index, run in enumerate(runs):
+            suffix = chr(ord("a") + index) if len(runs) > 1 else ""
+            set_id = f"{control}_{item}" + (f"_{suffix}" if suffix else "")
+            sets[set_id] = run
+    return sets
 
 
 class DocumentSource(Protocol):
@@ -119,12 +156,41 @@ class LocalFolderSource:
         self._manifest = self._load_manifest()
 
     def _load_manifest(self) -> dict[str, dict]:
+        """Flatten the manifest to one record per served document.
+
+        Two shapes are accepted. A flat list keyed by filename is the minimal
+        hand-written case. The generated form is nested -- item, then set, then
+        documents -- because a filing can be served in parts (item 795 is eight
+        PDFs in two sets) and a single filename field cannot hold that. Item and
+        set metadata is merged down onto each document so lookup stays by
+        filename.
+        """
         path = self.root / "manifest.json"
         if not path.exists():
             return {}
         with path.open() as fh:
-            entries = json.load(fh)
-        return {e["filename"]: e for e in entries}
+            payload = json.load(fh)
+
+        if isinstance(payload, list):
+            return {e["filename"]: e for e in payload if e.get("filename")}
+
+        def filled(mapping: dict, drop: set[str]) -> dict:
+            """Nulls do not override. A set carries its own selection_note, and
+            leaving it unfilled must not erase the item's -- that note is the
+            record of why the document is in the corpus at all."""
+            return {k: v for k, v in mapping.items() if k not in drop and v is not None}
+
+        flat: dict[str, dict] = {}
+        for item in payload.get("items", []):
+            shared = filled(item, {"sets"})
+            for doc_set in item.get("sets", []):
+                set_shared = filled(doc_set, {"documents"})
+                for doc in doc_set.get("documents", []):
+                    name = doc.get("filename")
+                    if not name:
+                        continue
+                    flat[name] = {**shared, **set_shared, **filled(doc, set())}
+        return flat
 
     def list_documents(self, control_number: str) -> list[DocumentRef]:
         refs: list[DocumentRef] = []
@@ -149,6 +215,8 @@ class LocalFolderSource:
                     filename=path.name,
                     description=description,
                     page_offset=int(offset),
+                    set_id=meta.get("set_id"),
+                    retrieval_eligible=bool(meta.get("retrieval_eligible", True)),
                 )
             )
         return refs
@@ -250,6 +318,7 @@ __all__ = [
     "LocalFolderSource",
     "HttpSource",
     "iter_documents",
+    "group_document_sets",
     "sha256_bytes",
     "asdict",
 ]
