@@ -193,21 +193,24 @@ def test_workpapers_are_not_discarded(tmp_path):
 
 def test_mispairing_outranks_every_other_verdict():
     """A confident verdict on the wrong pair of files is the failure to avoid."""
-    clean = compare_numerics("1,234", "1,234")
+    clean = NumericResult(occurrences_expected=8000, occurrences_found=8000)
     assert verdict(
-        clean, AssociationResult(), structured=False, word_accuracy=12.0, containment=8.0
+        clean, AssociationResult(), structured=False, word_accuracy=12.0,
+        containment=8.0, native_words=7000
     ) == "likely_mispaired"
     assert verdict(
-        clean, AssociationResult(), structured=False, word_accuracy=99.9, containment=99.0
+        clean, AssociationResult(), structured=False, word_accuracy=99.9,
+        containment=99.0, native_words=7000
     ) != "likely_mispaired"
 
 
 def test_a_contained_fragment_is_partial_not_mispaired():
     """795 served a 371-page tariff as four ~100-page parts. Each part is really
     in the native; it just cannot fill it, and 26% measured the split."""
-    clean = compare_numerics("1,234", "1,234")
+    clean = NumericResult(occurrences_expected=8000, occurrences_found=8000)
     assert verdict(
-        clean, AssociationResult(), structured=False, word_accuracy=26.0, containment=98.0
+        clean, AssociationResult(), structured=False, word_accuracy=26.0,
+        containment=98.0, native_words=7000
     ) == "partial_pairing"
 
 
@@ -249,34 +252,8 @@ def test_over_common_values_are_not_scored():
     assert result.measurable == 0
 
 
-def test_primary_is_the_native_that_covers_the_served_document(tmp_path, monkeypatch):
-    """Item 773 ships a memo .docx and a memo-and-attachments .pdf.
-
-    Format rank picks the .docx and scores ~100%, because every word of the memo
-    is in the served filing -- while measuring a fifth of it.
-    """
-    import ocr_accuracy as oa
-
-    memo = tmp_path / "memo.docx"
-    full = tmp_path / "memo and attachments.pdf"
-    memo.touch()
-    full.touch()
-
-    texts = {
-        memo.name: "functionalization summary memorandum staff accounting",
-        full.name: (
-            "functionalization summary memorandum staff accounting "
-            "wholesale transmission distribution allocation revenue requirement "
-            "class distribution rate design responsibilities"
-        ),
-    }
-    monkeypatch.setattr(oa, "read_native", lambda p: oa.NativeDoc(text=texts[p.name]))
-
-    match = oa.NativeMatch(primary=memo, candidates=[memo, full])
-    chosen, coverage = oa.resolve_primary(match, texts[full.name])
-
-    assert chosen == full
-    assert coverage[full.name] > coverage[memo.name]
+# (superseded: selection is by numeric agreement, not word coverage --
+#  see test_the_native_whose_figures_round_trip_wins)
 
 
 # --- Page apparatus ---
@@ -391,3 +368,144 @@ def test_synonym_labels_make_reading_order_meaningless():
 
     alone = [("Meter Expenses", "27262")]
     assert check_association(alone, shredded).rate == 100.0
+
+
+# --- Ground truth must exist ---
+
+
+def test_an_empty_native_is_unmeasured_not_perfect():
+    """Item 773's native bundle contains a PDF of the same scan, with no text
+    layer. It extracted to nothing, 0 of 0 numeric tokens matched, and the
+    verdict read 100% word and 100% numeric. Absence of ground truth must never
+    present as perfect agreement."""
+    empty = compare_numerics("", "1,234 rows of served text")
+
+    assert empty.occurrence_accuracy == 100.0  # the arithmetic is unavoidable
+    assert verdict(
+        empty, AssociationResult(), structured=False, word_accuracy=100.0, native_words=0
+    ) == "no_ground_truth"
+
+
+def test_a_thin_native_is_also_rejected():
+    """A cover page or a one-line stub is not ground truth either."""
+    thin = NumericResult(occurrences_expected=3, occurrences_found=3)
+
+    assert verdict(
+        thin, AssociationResult(), structured=False, word_accuracy=100.0, native_words=12
+    ) == "no_ground_truth"
+
+
+def test_a_real_native_still_scores_normally():
+    num = NumericResult(occurrences_expected=8000, occurrences_found=8000)
+
+    assert verdict(
+        num, AssociationResult(), structured=False, word_accuracy=99.8, native_words=7000
+    ).startswith("exact_")
+
+
+def test_a_native_that_covers_little_of_the_document_is_not_ground_truth():
+    """Item 773's best native is a two-page memo: 191 words, 24 numeric tokens,
+    23.6% coverage of a 26-page filing. It clears every absolute floor and scores
+    100%, because every figure it contains really is in the served text. The
+    twenty pages of schedules it says nothing about are never examined."""
+    num = NumericResult(occurrences_expected=24, occurrences_found=24)
+
+    assert verdict(
+        num, AssociationResult(), structured=True, word_accuracy=100.0,
+        native_words=191, coverage=23.6,
+    ) == "no_ground_truth"
+
+
+def test_a_native_covering_most_of_the_document_still_scores():
+    num = NumericResult(occurrences_expected=8000, occurrences_found=8000)
+
+    assert verdict(
+        num, AssociationResult(), structured=False, word_accuracy=99.8,
+        native_words=7000, coverage=94.0,
+    ).startswith("exact_")
+
+
+
+
+# --- Ground truth is reported, not selected ---
+
+
+def test_every_candidate_is_reported(tmp_path, monkeypatch):
+    """Item 785's tariff exhibit round-trips 4,332 of 4,337 figures; its cover
+    letter round-trips 270 of 270. Six rules tried to name one of them as THE
+    native and each picked wrong somewhere. Both facts are recorded instead."""
+    import ocr_accuracy as oa
+
+    cover = tmp_path / "cover letter.docx"
+    exhibit = tmp_path / "Exhibit C - Tariff.docx"
+    cover.touch()
+    exhibit.touch()
+
+    prose = " ".join(f"word{a}{b}" for a in "abcdefgh" for b in "ijklmnop")
+    many = " ".join(f"{n},{n:03d}" for n in range(100, 200))
+    served = prose + " " + many + " 7,777"
+    texts = {
+        cover.name: prose + " " + " ".join(f"{n},{n:03d}" for n in range(100, 130)),
+        exhibit.name: prose + " " + many + " 9,999",
+    }
+    monkeypatch.setattr(oa, "read_native", lambda p: oa.NativeDoc(text=texts[p.name]))
+
+    match = oa.NativeMatch(primary=cover, candidates=[cover, exhibit])
+    scores = oa.report_natives(match, served)
+
+    assert len(scores) == 2
+    # Most figures first: the verdict rests on the best-evidenced candidate,
+    # not the highest rate.
+    assert scores[0].path == exhibit
+    assert scores[0].numeric_expected > scores[1].numeric_expected
+    assert scores[1].numeric_accuracy > scores[0].numeric_accuracy
+
+
+def test_natives_below_the_word_floor_are_dropped(tmp_path, monkeypatch):
+    """A PDF of the same scan carries no text and is not ground truth."""
+    import ocr_accuracy as oa
+
+    empty = tmp_path / "scan.pdf"
+    real = tmp_path / "real.docx"
+    empty.touch()
+    real.touch()
+
+    prose = " ".join(f"word{a}{b}" for a in "abcdefgh" for b in "ijklmnop")
+    texts = {empty.name: "", real.name: prose + " 1,234"}
+    monkeypatch.setattr(oa, "read_native", lambda p: oa.NativeDoc(text=texts[p.name]))
+
+    match = oa.NativeMatch(primary=empty, candidates=[empty, real])
+    scores = oa.report_natives(match, prose + " 1,234")
+
+    assert [s.path for s in scores] == [real]
+
+
+def test_several_plausible_natives_defers_the_verdict():
+    """Item 785's Settlement Agreement carries 12,049 figures at 95.88% because
+    the native PDF holds the agreement AND its exhibits inline; Exhibit C holds
+    the 4,337 that were served, at 99.89%. No single number describes the set."""
+    num = NumericResult(occurrences_expected=12049, occurrences_found=11553)
+
+    assert verdict(
+        num, AssociationResult(), structured=False, word_accuracy=99.7,
+        native_words=8000, coverage=94.7, candidates=5,
+    ) == "multiple_candidates"
+
+
+def test_a_single_native_still_gets_a_verdict():
+    num = NumericResult(occurrences_expected=8081, occurrences_found=8031)
+
+    assert verdict(
+        num, AssociationResult(), structured=False, word_accuracy=99.8,
+        native_words=7000, coverage=95.4, candidates=1,
+    ).startswith("exact_")
+
+
+def test_deferral_does_not_mask_a_missing_native():
+    """A bundle of fragments is still no_ground_truth, not merely ambiguous."""
+    num = NumericResult(occurrences_expected=42, occurrences_found=42)
+
+    assert verdict(
+        num, AssociationResult(), structured=False, word_accuracy=100.0,
+        native_words=200, coverage=23.6, candidates=5,
+    ) == "no_ground_truth"

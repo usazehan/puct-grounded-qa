@@ -32,12 +32,19 @@ import argparse
 import json
 import re
 import sys
+import warnings
 from collections import Counter
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+# A corpus of agency filings contains malformed files, and their parser noise
+# buries the report. Silenced by default and restored by --show-parse-errors,
+# because a document that will not parse is a finding, not a nuisance: it ends
+# up unmeasured, and unmeasured must not read as clean.
+warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
 
 from puctqa.extract import extract_document  # noqa: E402
 from puctqa.sources import DocumentRef  # noqa: E402
@@ -269,6 +276,24 @@ NATIVE_SUFFIXES = {".docx", ".pdf", ".xlsx", ".xlsm"}
 FORMAT_PREFERENCE = {".docx": 0, ".pdf": 1, ".xlsx": 2, ".xlsm": 3}
 TEXT_SUFFIXES = {".docx", ".pdf"}
 
+# A comparison needs something to compare against. Item 773's native bundle
+# contains a PDF of the same scan, with no text layer -- it extracted to nothing,
+# so 0 of 0 numeric tokens matched and the verdict read 100%. Absence of ground
+# truth must never present as perfect agreement, so a native this thin is
+# reported as no_ground_truth rather than scored.
+MIN_GROUND_TRUTH_WORDS = 50
+MIN_GROUND_TRUTH_NUMERICS = 20
+
+# Absolute counts are not enough. Item 773's best native is a two-page memo:
+# 191 words and 24 numeric tokens, clearing the floor above while covering 23.6%
+# of a 26-page filing. It scores 100% because every figure it contains really is
+# in the served text -- and the twenty-odd pages of schedules it says nothing
+# about are never examined. So the native must also account for a fair share of
+# the SERVED document. This is the mirror of the partial_pairing check: there the
+# served file was a fragment of the native, here the native is a fragment of the
+# served file.
+MIN_NATIVE_COVERAGE = 60.0
+
 # Below this word accuracy, a mispairing is likelier than bad OCR. Measured
 # runs sit at 99.9-100%, so this is not a close call.
 MISPAIR_FLOOR = 50.0
@@ -324,32 +349,103 @@ def find_natives(native_dir: Path, ref: DocumentRef) -> NativeMatch | None:
     )
 
 
-def resolve_primary(match: NativeMatch, ocr_text: str) -> tuple[Path, dict[str, float]]:
-    """Pick the bundle file that accounts for most of the served document.
+@dataclass
+class NativeScore:
+    """One candidate native, scored on the axis that matters and the one that doesn't."""
 
-    Coverage is |native words in OCR| / |OCR words| -- what fraction of the
-    served text this native explains. Recall would not work here: a one-page
-    memo scores perfectly against the filing that contains it.
+    path: Path
+    numeric_accuracy: float  # of ITS OWN tokens, how many the served text has
+    numeric_expected: int
+    word_coverage: float  # how much of the served text this native explains
+
+
+def score_natives(match: NativeMatch, ocr_text: str) -> list[NativeScore]:
+    """Score every text native in the bundle.
+
+    Numeric accuracy is scoped to the native's own tokens: of the figures THIS
+    document contains, how many round-trip into the served rendering. Word
+    coverage is reported alongside, and is deliberately not used to choose --
+    it answers a different question and choosing on it picked wrong.
     """
     ocr_words = word_types(ocr_text)
-    if not ocr_words or len(match.candidates) < 2:
-        return match.primary, {}
-
-    scores: dict[str, float] = {}
+    scores: list[NativeScore] = []
     for path in match.candidates:
         try:
-            words = word_types(read_native(path).text)
+            text = read_native(path).text
         except Exception:
             continue
-        scores[path.name] = len(words & ocr_words) / len(ocr_words) * 100
+        words = word_types(text)
+        if len(words) < MIN_GROUND_TRUTH_WORDS:
+            continue
+        result = compare_numerics(text, ocr_text)
+        scores.append(
+            NativeScore(
+                path=path,
+                numeric_accuracy=result.occurrence_accuracy,
+                numeric_expected=result.occurrences_expected,
+                word_coverage=(
+                    len(words & ocr_words) / len(ocr_words) * 100 if ocr_words else 0.0
+                ),
+            )
+        )
+    return scores
 
-    if not scores:
-        return match.primary, {}
-    best = max(
-        match.candidates,
-        key=lambda p: (scores.get(p.name, -1.0), -FORMAT_PREFERENCE.get(p.suffix.lower(), 9)),
-    )
-    return best, scores
+
+def report_natives(match: NativeMatch, ocr_text: str) -> list[NativeScore]:
+    """Every candidate above the ground-truth floors, best evidence first.
+
+    SIX SELECTION RULES FAILED BEFORE THIS ONE STOPPED SELECTING
+
+      - Format rank picked item 773's memo-only .docx over the
+        memo-and-attachments .pdf: a fifth of the filing scoring near 100%.
+      - Word coverage picked item 785's Settlement Agreement (94.7% of served
+        words, 95.9% numeric) over Exhibit C (81.9%, 99.88%). Coverage optimises
+        for prose; the figures live in the exhibits.
+      - Unioning the bundle scored 72.9%: the ZIP holds every exhibit filed in
+        the docket, while the served set is a subset of them.
+      - Raw numeric agreement picked a 270-figure cover letter at 100.0% over
+        Exhibit C's 4,332 of 4,337. Optimising a rate finds the native with
+        least evidence.
+      - Requiring a minimum figure count did not help, because 100.0 still
+        outranks 99.88 before the count is ever consulted.
+      - Rounding the rate so counts break near-ties would have worked for 785
+        and only for 785; 99.4% and 100% still differ.
+
+    All six tried to name THE native for a served set. Often there is not one: a
+    settlement is served as an agreement plus seven exhibit workbooks, and no
+    single file corresponds to the filing.
+
+    So this reports instead of choosing. A reader sees that item 785's tariff
+    exhibit round-trips 4,332 of 4,337 figures while its cover letter
+    round-trips 270 of 270, and can tell which fact matters. The verdict is
+    computed from the best-evidenced candidate, and every candidate is recorded
+    beside it, so the judgement is visible rather than buried in a rank function.
+    """
+    ocr_words = word_types(ocr_text)
+    scores: list[NativeScore] = []
+    for path in match.candidates:
+        try:
+            text = read_native(path).text
+        except Exception:
+            continue
+        words = word_types(text)
+        if len(words) < MIN_GROUND_TRUTH_WORDS:
+            continue
+        result = compare_numerics(text, ocr_text)
+        scores.append(
+            NativeScore(
+                path=path,
+                numeric_accuracy=result.occurrence_accuracy,
+                numeric_expected=result.occurrences_expected,
+                word_coverage=(
+                    len(words & ocr_words) / len(ocr_words) * 100 if ocr_words else 0.0
+                ),
+            )
+        )
+    # Most figures first: the verdict should rest on the candidate that puts the
+    # most evidence behind its rate, not the one with the highest rate.
+    scores.sort(key=lambda s: -s.numeric_expected)
+    return scores
 
 
 @dataclass
@@ -603,6 +699,9 @@ def verdict(
     structured: bool,
     word_accuracy: float,
     containment: float = 100.0,
+    native_words: int = MIN_GROUND_TRUTH_WORDS,
+    coverage: float = 100.0,
+    candidates: int = 1,
 ) -> str:
     """Per-document capability, in the vocabulary of the ingestion flag.
 
@@ -613,6 +712,24 @@ def verdict(
     native -- the pairing is right and the served side is missing parts, which
     is what 795's eight ~100-page PDFs looked like against one 371-page native.
     """
+    # Nothing to compare against is not a passing grade. Checked first: every
+    # accuracy below divides by a count that may be zero, and 0/0 reads as 100%.
+    if (
+        native_words < MIN_GROUND_TRUTH_WORDS
+        or num.occurrences_expected < MIN_GROUND_TRUTH_NUMERICS
+        or coverage < MIN_NATIVE_COVERAGE
+    ):
+        return "no_ground_truth"
+    # More than one plausible native means no single number describes the set,
+    # and seven rules have now tried to manufacture one. Item 785's Settlement
+    # Agreement holds 12,049 figures at 95.88% because the native PDF carries
+    # the agreement AND its exhibits inline; Exhibit C holds the 4,337 that were
+    # actually served, at 99.89%. More figures is not better evidence when the
+    # extra ones come from a superset. The candidate table carries all of it and
+    # a human names the operative ground truth in the manifest, the same place
+    # the 795 A/B decision lives.
+    if candidates > 1:
+        return "multiple_candidates"
     # A confident verdict on the wrong pair of files is the failure this whole
     # script exists to avoid, so it is checked before anything else is believed.
     if word_accuracy < MISPAIR_FLOOR:
@@ -635,6 +752,16 @@ def verdict(
 
 
 VERDICT_NOTE = {
+    "multiple_candidates": (
+        "the bundle holds several plausible natives and no single one corresponds to "
+        "what was served -- read the candidate table and record the operative one in "
+        "the manifest; numeric claims are refused by policy until someone does"
+    ),
+    "no_ground_truth": (
+        "the paired native carries too little text to compare against -- often a PDF "
+        "of the same scan, with no text layer. Nothing about this document has been "
+        "verified; it is unmeasured, not clean"
+    ),
     "partial_pairing": (
         "the served text is contained in the native but does not fill it -- this is "
         "part of a multi-part filing and its accuracy cannot be read on its own"
@@ -666,6 +793,11 @@ def main() -> int:
     ap.add_argument("pdf_dir", type=Path)
     ap.add_argument("native_dir", type=Path)
     ap.add_argument("--show-errors", action="store_true")
+    ap.add_argument(
+        "--show-parse-errors",
+        action="store_true",
+        help="restore openpyxl/MuPDF warnings, silenced by default",
+    )
     ap.add_argument("--json", type=Path, default=None, help="write per-document verdicts")
     ap.add_argument(
         "--line-tolerance",
@@ -674,6 +806,8 @@ def main() -> int:
         help="lines allowed between a value and its row label; calibrate per corpus",
     )
     args = ap.parse_args()
+    if args.show_parse_errors:
+        warnings.resetwarnings()
 
     served_sets = group_served_sets(sorted(args.pdf_dir.glob("*.[pP][dD][fF]")))
     matched: list[tuple[ServedSet, NativeMatch]] = []
@@ -715,12 +849,19 @@ def main() -> int:
     broken_pairs: list[tuple[str, str, str, str]] = []
     anchor_summaries: list[tuple[str, dict[str, int]]] = []
     distance_histogram: list[int] = []
+    unreadable: list[tuple[str, str, str]] = []
 
     for served, match in matched:
         parts = [extract_document(p.read_bytes()) for p in served.parts]
         ocr_text = "\n".join(part.text for part in parts)
-        primary_path, coverage = resolve_primary(match, ocr_text)
-        native = read_native(primary_path)
+        candidates = report_natives(match, ocr_text)
+        primary_path = candidates[0].path if candidates else match.primary
+        coverage = {c.path.name: round(c.word_coverage, 1) for c in candidates}
+        try:
+            native = read_native(primary_path)
+        except Exception as exc:
+            unreadable.append((served.label, primary_path.name, type(exc).__name__))
+            native = NativeDoc(text="", kind="unreadable")
 
         # Whether a bundle spreadsheet is this document's own tables or somebody
         # else's workpaper is measurable, not assumable. Item 786's four
@@ -742,10 +883,15 @@ def main() -> int:
         for workpaper in match.structured:
             if workpaper == primary_path:
                 continue
+            try:
+                workpaper_pairs = read_xlsx(workpaper).pairs
+            except Exception as exc:
+                # One corrupt workbook in one bundle must not lose the results
+                # for every other set. Recorded, not swallowed.
+                unreadable.append((served.label, workpaper.name, type(exc).__name__))
+                continue
             candidate = [
-                (label, token)
-                for label, token in read_xlsx(workpaper).pairs
-                if token in served_tokens
+                (label, token) for label, token in workpaper_pairs if token in served_tokens
             ]
             # Coverage of the served document's DISTINCT values, not pairs per
             # token -- a large model with repeated values clears a ratio of
@@ -782,7 +928,13 @@ def main() -> int:
         )
         num = compare_numerics(native.text, ocr_text)
         assoc = check_association(pairs, ocr_text, tolerance=args.line_tolerance)
-        doc_verdict = verdict(num, assoc, structured, word_acc, containment)
+        # What fraction of the served document this native accounts for. The
+        # best available native may still explain almost none of it.
+        native_coverage = coverage.get(primary_path.name, 100.0)
+        doc_verdict = verdict(
+            num, assoc, structured, word_acc, containment,
+            len(native_words), native_coverage, len(candidates),
+        )
 
         total["words"] += len(native_words)
         total["words_ok"] += words_ok
@@ -841,6 +993,22 @@ def main() -> int:
                 "verdict": doc_verdict,
                 "verdict_note": VERDICT_NOTE[doc_verdict],
                 "numeric_verifiable": doc_verdict.startswith("exact_"),
+                "native_coverage_pct": round(native_coverage, 1),
+                "verified_through": primary_path.name,
+                # Every candidate, not just the one the verdict rests on. Item
+                # 785's tariff exhibit and its cover letter tell different
+                # stories and both belong in the record.
+                "candidates": [
+                    {
+                        "native": c.path.name,
+                        "numeric_accuracy": round(c.numeric_accuracy, 3),
+                        "numeric_expected": c.numeric_expected,
+                        "word_coverage": round(c.word_coverage, 1),
+                    }
+                    for c in candidates
+                ],
+                "native_words": len(native_words),
+                "native_numerics": num.occurrences_expected,
             }
         )
         merged: Counter = Counter()
@@ -924,6 +1092,39 @@ def main() -> int:
     # different provenance -- 773's clean tables with 795-B's delta against a
     # sibling's native -- and describes none of them. Same reason the split
     # parts of 795 could not be read individually.
+    multi = [r for r in reports if len(r.get("candidates", [])) > 1]
+    if multi:
+        print(f"Sets with several plausible natives ({len(multi)}) -- verdict deferred:")
+        for r in multi:
+            print(f"  {r['document'][:44]}")
+            for c in r["candidates"][:6]:
+                print(
+                    f"     {c['numeric_accuracy']:>6.2f}% of {c['numeric_expected']:>6} "
+                    f"figures   {c['word_coverage']:>5.1f}% of text   {c['native'][:44]}"
+                )
+        print("  No single file is 'the' native for a set served as an agreement plus")
+        print("  its exhibits, and more figures is not better evidence when the extra")
+        print("  ones come from a superset. Name the operative native in the manifest;")
+        print("  until then these sets refuse numeric claims by policy.")
+        print()
+    if unreadable:
+        print(f"Native files that could not be parsed ({len(unreadable)}):")
+        for doc, name, kind in unreadable:
+            print(f"  {doc[:30]:<32} {name[:44]:<46} {kind}")
+        print("Those files contributed nothing. If one was a set's only ground truth,")
+        print("the set is unmeasured -- check its verdict below rather than assuming.")
+        print()
+    unmeasured = [r["document"] for r in reports if r["verdict"] == "no_ground_truth"]
+    if unmeasured:
+        print("STOP: no usable ground truth for:")
+        for name in unmeasured:
+            print(f"  {name}")
+        print("No native in the bundle accounts for enough of the served document to")
+        print("verify it -- either it carries almost no text (a PDF of the same scan) or")
+        print("it is a short memo beside a long filing. These documents are UNMEASURED,")
+        print("not clean: a 100% here means every figure in a fragment matched, while")
+        print("the pages that fragment says nothing about were never examined.")
+        print()
     failing = [r["document"] for r in reports if r["verdict"] == "refuse_numerics"]
     numeric = pct("num_occ_ok", "num_occ")
     if not failing:
