@@ -66,8 +66,9 @@ from .extract import ExtractedDocument, PageSpan
 # table cells, not content, and they never start a row.
 NUMERIC_LINE_RE = re.compile(r"^[\s$()\-\d,.%]*$")
 
-# Calibrate per corpus. See the module docstring: item 773 shows a clean gap at
-# ~15, but a corpus of born-digital filings with wide tables may not.
+# Calibrate per corpus, against MEDIAN line length -- see classify_page. Item
+# 773's schedules sit at 6.8-12.7 and its memo pages at 25.8-72.5; item 795's
+# tariff runs to a median of 55.9 overall with rate sheets far below it.
 CHARS_PER_LINE_THRESHOLD = 15.0
 
 # A data row is a label followed by at least this many numeric lines. A window
@@ -86,9 +87,25 @@ TARGET_CHARS = 1200
 MAX_CHARS = 2000
 
 
+# A DOTTED section number alone on a line: "4.1.1", "3.2". Bare integers are
+# deliberately excluded -- a rate schedule's account numbers and a table of
+# contents' page numbers look identical, and counting them flagged item 773's
+# O&M schedule (560, 561, 566, and bare currency symbols) as navigation.
+SECTION_NUMBER_RE = re.compile(r"^\s*\d+(?:\.\d+)+\.?\s*$")
+
+# Item 795's table of contents runs seven sheets of "3.1 / APPLICABILITY / 22",
+# which the median classifier reads as a table: short lines, numeric cells, a
+# header block. It is neither prose nor a rate schedule -- it answers no
+# question, and its figures are page numbers. A count rather than a ratio,
+# because a schedule page has ZERO dotted section numbers in its body while a
+# contents page has dozens; the separation is not close enough to need tuning.
+MIN_SECTION_NUMBERS = 5
+
+
 class PageKind(str, Enum):
     PROSE = "prose"
     TABLE = "table"
+    NAVIGATION = "navigation"
 
 
 @dataclass
@@ -157,13 +174,43 @@ def split_lines(text: str, start: int, end: int) -> list[Line]:
     return lines
 
 
+def is_navigation(lines: list[Line]) -> bool:
+    """A table of contents or index, which is neither prose nor data.
+
+    Indexing it means retrieval surfaces "3.4 CHARGES ASSOCIATED WITH DELIVERY
+    SERVICE 23" for a query about delivery charges -- a chunk that names the
+    section a reader wants and contains none of it.
+    """
+    content = [l for l in lines if not l.is_blank]
+    if len(content) < 8:
+        return False
+    return sum(1 for l in content if SECTION_NUMBER_RE.match(l.text)) >= MIN_SECTION_NUMBERS
+
+
 def classify_page(lines: list[Line]) -> PageKind:
-    """Prose or table, by mean characters per non-blank line."""
+    """Prose or table, by MEDIAN characters per non-blank line.
+
+    The mean was tried first and misclassified item 795's rate schedules. Every
+    tariff sheet opens with a fixed header block -- chapter, sheet number,
+    company, service area, applicability -- and those long lines pull the mean
+    of a page whose body is short numeric cells above the threshold. Page 43 of
+    one part is a class allocation table (CLASS / PBRAF / Residential /
+    40.4859 %) and measured 15.4 chars per line; page 12 is a fee schedule at
+    16.3. Both chunked as prose, which loses the header block those figures
+    depend on -- a chunk reading "Residential 40.4859 %" with no sheet number
+    and no effective date is a rate with no idea which tariff version it is.
+
+    A median ignores a fixed number of outlying lines by construction, which is
+    exactly what a page header is.
+    """
     content = [l for l in lines if not l.is_blank]
     if not content:
         return PageKind.PROSE
-    mean = sum(len(l.text) for l in content) / len(content)
-    return PageKind.PROSE if mean >= CHARS_PER_LINE_THRESHOLD else PageKind.TABLE
+    if is_navigation(lines):
+        return PageKind.NAVIGATION
+    lengths = sorted(len(l.text) for l in content)
+    median = lengths[len(lengths) // 2]
+    return PageKind.PROSE if median >= CHARS_PER_LINE_THRESHOLD else PageKind.TABLE
 
 
 def find_header_end(lines: list[Line]) -> int:
@@ -315,7 +362,10 @@ def chunk_document(extracted: ExtractedDocument, document_id: str) -> list[Chunk
     chunks: list[Chunk] = []
     for span in extracted.citable_pages():
         lines = split_lines(extracted.text, span.char_start, span.char_end)
-        if classify_page(lines) is PageKind.TABLE:
+        kind = classify_page(lines)
+        if kind is PageKind.NAVIGATION:
+            continue
+        if kind is PageKind.TABLE:
             chunks.extend(chunk_table_page(lines, span, document_id, len(chunks)))
         else:
             chunks.extend(chunk_prose_page(lines, span, document_id, len(chunks)))

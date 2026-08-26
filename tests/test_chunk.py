@@ -224,3 +224,100 @@ def test_anchor_scheme_travels_with_the_chunk():
     assert by_page[1].anchor_scheme == "page_label"
     assert by_page[2].anchor_scheme == "pdf_page"
     assert summarize(chunks)["weakly_anchored"] >= 1
+
+def test_a_page_header_does_not_make_a_table_read_as_prose():
+    """Item 795's tariff sheets open with a fixed six-line header. On a rate
+    schedule those long lines pull the MEAN above the threshold -- page 43
+    measured 15.4 chars/line and chunked as prose, losing the sheet number and
+    effective date its figures depend on. The median ignores them."""
+    header = [
+        "Chapter 6: Company Specific Items",
+        "Sheet No. 6.7.2",
+        "Page 30 of 30",
+        "CenterPoint Energy Houston Electric, LLC",
+        "Applicable: Entire Service Area",
+        "PERIODIC BILLING REQUIREMENT ALLOCATION FACTORS",
+    ]
+    rows = ["CLASS", "PBRAF", "Residential", "40.4859 %", "MGS", "29.1622 %",
+            "LGS", "16.1753 %"]
+    lines = lines_of("\n".join(header + rows))
+
+    content = [l for l in lines if not l.is_blank]
+    mean = sum(len(l.text) for l in content) / len(content)
+    assert mean >= CHARS_PER_LINE_THRESHOLD  # the mean would call this prose
+
+    assert classify_page(lines) is PageKind.TABLE
+    
+def test_able_of_contents_is_not_indexed():
+    """Item 795 opens with seven sheets of contents. The median classifier reads
+    them as tables -- short lines, numeric cells, a header block -- and indexing
+    them means a query about delivery charges retrieves '3.4 CHARGES ASSOCIATED
+    WITH DELIVERY SERVICE 23', which names the section and contains none of it."""
+    toc = "\n".join([
+        "Table of Contents", "Sheet No. TOC-1", "Page 2 of 7",
+        "CenterPoint Energy Houston Electric, LLC",
+        "4.1", "GENERAL SERVICE RULES AND REGULATIONS", "28",
+        "4.1.1", "APPLICABILITY OF CHAPTER", "28",
+        "4.1.2", "REQUIRED NOTICE", "28",
+        "4.2", "LIMITS ON LIABILITY", "28",
+        "4.2.1", "LIABILITY BETWEEN PARTIES", "29",
+    ])
+    assert classify_page(lines_of(toc)) is PageKind.NAVIGATION
+ 
+ 
+def test_a_rate_schedule_is_not_mistaken_for_contents():
+    """Account numbers and page numbers look identical. Only DOTTED section
+    numbers count, so item 773's O&M schedule (560, 561, 566) is safe."""
+    assert classify_page(lines_of(TABLE_PAGE)) is PageKind.TABLE
+ 
+ 
+def test_navigation_pages_produce_no_chunks():
+    doc = build(prose=PROSE_PAGE, table="\n".join(
+        ["Table of Contents", "Sheet No. TOC-1", "Page 1 of 7", "CenterPoint Energy",
+         "3.1", "APPLICABILITY", "22", "3.2", "GENERAL", "22",
+         "3.3", "DESCRIPTION OF SERVICE", "22", "3.4", "CHARGES", "23",
+         "3.5", "METERING", "24"]
+    ))
+    assert all(c.page_start == 1 for c in chunk_document(doc, "doc.pdf"))
+ 
+ 
+def test_a_table_of_contents_is_not_indexed():
+    """Item 795's tariff runs seven TOC sheets of "3.1 / APPLICABILITY / 22".
+    Short lines, so the median calls them tables -- but indexing one means a
+    query about delivery charges surfaces a chunk that names the section and
+    contains none of it."""
+    toc = "\n".join([
+        "Table of Contents", "Sheet No. TOC-1", "Page 1 of 7",
+        "CenterPoint Energy Houston Electric, LLC", "CNP 8008",
+        "TABLE OF CONTENTS",
+        "3.1", "APPLICABILITY", "22",
+        "3.2", "GENERAL", "22",
+        "3.3", "DESCRIPTION OF SERVICE", "22",
+        "3.4", "CHARGES ASSOCIATED WITH DELIVERY SERVICE", "23",
+        "3.5", "METERING", "24",
+        "3.6", "SERVICE ENTRANCE", "25",
+    ])
+    assert classify_page(lines_of(toc)) is PageKind.NAVIGATION
+ 
+ 
+def test_a_rate_schedule_is_not_mistaken_for_navigation():
+    """Sheet numbers in the header must not trip the section-number count."""
+    schedule = "\n".join([
+        "Chapter 6: Company Specific Items", "Sheet No. 6.6", "Page 6 of 10",
+        "CenterPoint Energy Houston Electric, LLC", "CNP 8020",
+        "TYPE OF LAMP", "T&D", "CHARGE",
+        "Metal Halide (175w) (no new installations)", "$9.24", "12,900", "210", "70",
+        "Metal Halide (250w) (no new installations)", "$17.08", "19,475", "294", "98",
+    ])
+    assert classify_page(lines_of(schedule)) is PageKind.TABLE
+ 
+ 
+def test_navigation_pages_produce_no_chunks(monkeypatch):
+    import puctqa.chunk as chunk_module
+ 
+    toc_lines = ["TABLE OF CONTENTS"] + [
+        part for n in range(1, 9) for part in (f"3.{n}", f"SECTION {n} HEADING", str(20 + n))
+    ]
+    monkeypatch.setattr(chunk_module, "classify_page", lambda lines: PageKind.NAVIGATION)
+    assert chunk_document(build(), "doc.pdf") == []
+ 
