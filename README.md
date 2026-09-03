@@ -4,10 +4,12 @@ Question answering over Texas Public Utility Commission rate-case filings, where
 **every factual claim is verified against a source span before the answer is
 returned**. When verification fails, the system refuses rather than guessing.
 
-> **Status: Week 1 complete.** Acquisition, extraction, citation anchoring,
-> extraction-fidelity measurement, schema, ingestion, and layout-aware chunking
-> are built and tested. Retrieval, the grounding guard, and the eval harness are
-> not. See `DESIGN.md` for the full spec.
+> **Status: retrieval measured, guard half built.** Acquisition, extraction,
+> citation anchoring, extraction-fidelity measurement, schema, ingestion,
+> layout-aware chunking, embeddings, and hybrid retrieval are built and tested,
+> with a retrieval eval harness over a hand-written question set. The guard
+> verifies claims but nothing generates them yet, so the refusal questions are
+> unscored. See `DESIGN.md` for the full spec.
 
 ---
 
@@ -66,6 +68,14 @@ python scripts/build_manifest.py data/FilingExport_49421.xlsx \
 make probe DIR=data/raw
 python scripts/ocr_accuracy.py data/raw data/native --json data/ocr_report.json
 python scripts/ingest.py data/raw --docket 49421 --verdicts data/ocr_report.json
+```
+
+Then chunk, embed, and measure retrieval over the sets marked retrievable:
+
+```bash
+python scripts/chunk_corpus.py
+python scripts/embed_chunks.py
+python scripts/eval_retrieval.py --k 3 --show-misses
 ```
 
 ---
@@ -154,6 +164,77 @@ rather than from a guess about the file.
 
 ---
 
+## Retrieval
+
+817 chunks over the 6 retrieval-eligible sets, embedded with
+`Qwen/Qwen3-Embedding-0.6B` at 1024 dimensions. Two arms — pgvector cosine and
+Postgres full-text over the `simple` configuration — fused by reciprocal rank.
+Measured against 10 answerable questions in `evals/questions.jsonl`:
+
+| config | recall@3 | MRR | recall@1 |
+|---|---|---|---|
+| lexical | 90% | 0.683 | 50% |
+| dense | 60% | 0.550 | 50% |
+| **hybrid** | **100%** | **0.833** | **70%** |
+
+The arms fail on different questions, which is the argument for fusing them:
+lexical misses the one question phrased conceptually, dense misses four that
+name a figure or an acronym. Ranks are fused rather than scores, because cosine
+distance and `ts_rank` are not on a common scale and any weighting between them
+would be a constant nobody could defend.
+
+Lexical alone outranks dense on this corpus. Questions here name `PBRAF`, `LGS`,
+`UEDIT`, and `Sheet 6.7.2`, and literal matching handles those better than
+semantic similarity does.
+
+### Retrieval can hand over a plausible wrong chunk
+
+For *"what return on equity did CenterPoint request?"*, the top result is the
+findings-of-fact page stating the **agreed** 9.4% — not the background page
+stating the **requested** 10.4%. A claim built on that chunk quotes accurately
+and its figure is genuinely present, so span verification and numeric
+verification both pass. The answer is still wrong.
+
+Three figures in this docket are one word apart: 10.4% requested, 9.45%
+recommended by the ALJs, 9.4% approved. Nothing in a quoted figure distinguishes
+them.
+
+`DESIGN.md` treats misattribution as an LLM interpretation limit — a correctly
+quoted figure applied to the wrong entity. It starts earlier than that. Nothing
+downstream of retrieval has the information to notice, which is why the guard
+compares what a claim *asserts* against what its source *states*, and not only
+whether the digits match.
+
+---
+
+## The grounding guard
+
+Three checks, separate because they fail for different reasons and collapsing
+them would lose which one failed.
+
+**Span verification is fuzzy.** The quoted span must appear in the cited chunk,
+but not byte for byte: item 795-A contains `PERIODIC BILLING RE UIREMENT` and
+`ATIACHMENT D` in a document measuring 99.8% word accuracy. An exact match would
+refuse a quotation that is visibly on the page.
+
+**Numeric verification is exact.** 795-A round-trips 8,031 of 8,081 figures
+against a covering native, so a figure that does not match is wrong rather than
+rendered differently. Sign and unit are part of identity: `(1,234)` is not
+`1,234`, and `10.4%` is not `10.4`.
+
+**Predicate verification** catches what the other two cannot — a claim asserting
+`requested` while its source states `agreed`. It is a word-set test standing in
+for a semantic one, with a vocabulary fitted to this docket, and it is the piece
+most likely to need replacing. Checking only the quoted span let a claim dodge it
+by quoting tightly around the figure, so it falls back to the chunk: the
+predicate is a property of the passage, the figure is what must be in the span.
+
+All three are tested against hand-written claims from real corpus text, half
+correct and half wrong in ways that matter. No model is involved, which is the
+point — a verifier is testable before the thing it verifies exists.
+
+---
+
 ## Citation anchors resolve by hierarchy
 
 PDF page numbers are weak: page 1 is the Interchange barcode cover sheet, and
@@ -213,6 +294,15 @@ carries its page header, including `(amounts in thousands)`. Without that, a
 verified `4,231` is wrong by a factor of a thousand and the guard cannot catch it,
 because the digits match exactly.
 
+Pleading line numbers — the 1–25 running down a testimony margin — are dropped
+from both the classification statistic and the chunk text. On item 788 they are
+roughly half of every page, which dragged the median to 3 and made prose
+testimony classify as a table: one chunk came out 2,854 characters of "header"
+around 100 characters of body. They also had to leave the chunk text on their
+own account. A small integer appearing on every line of every page satisfies
+exact numeric verification anywhere, which is the trap behind one of the
+negative controls in the eval set.
+
 Which means chunk text is **not** a contiguous document slice: it is header plus
 body. Both are real spans and both are recorded, so the guard must verify a claim
 against one span or the other, never the concatenation.
@@ -263,14 +353,24 @@ src/puctqa/
   extract.py     PDF extraction, page-offset mapping, anchor resolution
   filters.py     Stage 1 triage with auditable exclusion reasons
   chunk.py       layout-aware chunking; prose by budget, tables by row
+  retrieve.py    dense + lexical + trigram arms, fused by reciprocal rank
+  guard.py       span, numeric, and predicate verification
 scripts/
   build_manifest.py      export -> manifest; merges, never overwrites assertions
   probe_extraction.py    corpus report + threshold calibration
   ocr_accuracy.py        extraction fidelity against native bundles
   ingest.py              persist sets, documents, text, page spans, anchors
+  chunk_corpus.py        chunk the eligible sets and persist with spans
+  embed_chunks.py        embed persisted chunks; records the model per row
+  eval_retrieval.py      recall and MRR per configuration and category
+  find_answers.py        search the eligible corpus while writing questions
 migrations/
   001_init.sql           filings, documents, chunks, claims, eval tables
   002_document_sets.sql  sets, verdicts, page anchors, refusal provenance
+  003_chunk_layout.sql   chunk kind and header spans
+  004_embeddings.sql     embedding provenance
+evals/
+  questions.jsonl        15 hand-written questions, 5 of them refusals
 tests/                   no network or DB required
 ```
 
@@ -280,12 +380,25 @@ tests/                   no network or DB required
 
 - [x] **W1** Acquisition, extraction, offsets, anchoring, fidelity measurement,
       schema, ingestion, chunking
-- [ ] **W2** Embeddings, pgvector retrieval over retrieval-eligible sets
-- [ ] **W3** Grounding guard: span + numeric verification, refusal, eval harness
+- [x] **W2** Embeddings, hybrid retrieval over retrieval-eligible sets, eval
+      harness and a first measured baseline
+- [ ] **W3** Grounding guard — span, numeric, and predicate verification are
+      built and tested; claim generation is not, so the refusal questions are
+      unscored
 - [ ] **W4** Structured logging, cost accounting, CI, deploy, results table
 
-Eval labeling runs continuously from W2 — 10–15 questions per week. The eval set
-needs negative controls from the start: a claim like *"CenterPoint reported 14
-outage events"* can pass exact numeric verification against a testimony chunk
-because pleading line numbers put a `14` in every chunk. Questions whose correct
-answer is a refusal are worth more than ordinary ones.
+`evals/questions.jsonl` holds 15 questions with verified answers and citation
+anchors, growing 10–15 a week. **Five are refusals**, which is the category the
+project exists for and the one most eval sets omit:
+
+- **Version ambiguity, found in the data rather than invented.** The residential
+  PBRAF is 40.0412% on sheet 6.7.1 and 40.4859% on 6.7.2; LOS-A appears at three
+  values across three sheets. Answering with any single figure is wrong.
+- **A question the corpus holds but cannot verify** — item 773, an OCR'd scan
+  with no covering native.
+- **The pleading-line trap.** *"How many outage events did CenterPoint report?"*
+  would have satisfied exact numeric verification against almost any testimony
+  chunk, because the margin numbering put a small integer in every one.
+
+Those five are unscored until something generates claims for the guard to check.
+Retrieval is measured; verification is tested; the piece between them is next.
