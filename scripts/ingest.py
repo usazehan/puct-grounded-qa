@@ -159,7 +159,7 @@ def upsert_set(cur, filing_id: int, set_id: str, meta: dict, verdict: dict | Non
             meta.get("retrieval_eligible"),
             meta.get("set_selection_note") or meta.get("selection_note"),
             (verdict or {}).get("verdict"),
-            (verdict or {}).get("numeric_verifiable"),
+            (verdict or {}).get("numeric_verifiable", False) or False,
             (verdict or {}).get("word_type_accuracy"),
             (verdict or {}).get("numeric_occurrence_accuracy"),
             (verdict or {}).get("association_rate"),
