@@ -321,3 +321,46 @@ def test_navigation_pages_produce_no_chunks(monkeypatch):
     monkeypatch.setattr(chunk_module, "classify_page", lambda lines: PageKind.NAVIGATION)
     assert chunk_document(build(), "doc.pdf") == []
  
+TESTIMONY_PAGE = "\n".join(
+    ["PUC Docket No. 49421", "Page 4 of 9"]
+    + [str(n) for n in range(1, 13)]
+    + ["1", "Q. WHAT IS THE AGREED RETURN ON EQUITY?",
+       "2", "A. The signatories agreed to a Return on Equity of 9.4%, and an agreed",
+       "3", "regulatory capital structure of 57.5% long-term debt and 42.5% equity.",
+       "4", "The foregoing WACC, Cost of Debt, ROE, and Capital Structure are in",
+       "5", "accord with the Public Utility Regulatory Act."]
+)
+
+
+def test_margin_numbering_does_not_make_testimony_a_table():
+    """Item 788's pages are roughly half bare line numbers, which drags the
+    median line length to 3. The page classified as a table, no data row was
+    found, and one chunk came out 2,854 characters of header around 100
+    characters of body."""
+    lines = lines_of(TESTIMONY_PAGE)
+
+    naive = sorted(len(l.text) for l in lines if not l.is_blank)
+    assert naive[len(naive) // 2] < CHARS_PER_LINE_THRESHOLD  # would be a table
+
+    assert classify_page(lines) is PageKind.PROSE
+
+
+def test_margin_numbers_are_not_chunk_text():
+    """Those digits would satisfy a numeric claim about anything."""
+    doc = build(prose=TESTIMONY_PAGE, table=TABLE_PAGE)
+    prose = [c for c in chunk_document(doc, "doc.pdf") if c.kind is PageKind.PROSE][0]
+
+    assert "9.4%" in prose.text
+    assert "\n1\n" not in "\n" + prose.text + "\n"
+    assert "\n2\n" not in "\n" + prose.text + "\n"
+
+
+def test_a_header_that_swallows_the_page_falls_back_to_prose():
+    """A title block is a handful of lines. If find_header_end returns most of
+    the page, no title block was found and the page is not a table."""
+    import puctqa.chunk as chunk_module
+
+    long_page = "\n".join(f"Paragraph {i} of continuous narrative text." for i in range(40))
+    doc = build(prose=PROSE_PAGE, table=long_page)
+    for c in chunk_document(doc, "doc.pdf"):
+        assert len(c.context) <= chunk_module.MAX_HEADER_CHARS

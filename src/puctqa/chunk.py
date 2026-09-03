@@ -66,6 +66,19 @@ from .extract import ExtractedDocument, PageSpan
 # table cells, not content, and they never start a row.
 NUMERIC_LINE_RE = re.compile(r"^[\s$()\-\d,.%]*$")
 
+# Pleading line numbers -- the 1-25 running down a testimony margin -- extract as
+# standalone one- and two-character lines. On item 788 they are roughly half of
+# every page, which drags the median line length to 3 and makes prose testimony
+# classify as a table. find_header_end then finds no data row, falls back to
+# MAX_HEADER_LINES, and produces a chunk of 2,854 characters of "header" around
+# 100 characters of body.
+#
+# They are page furniture, not content, and are excluded from both the
+# classification statistic and the chunk text. The same filter exists in
+# ocr_accuracy.py for the same reason: an integer appearing on every line of
+# every page satisfies exact numeric verification anywhere.
+PLEADING_LINE_RE = re.compile(r"^\s*\d{1,2}\s*$")
+
 # Calibrate per corpus, against MEDIAN line length -- see classify_page. Item
 # 773's schedules sit at 6.8-12.7 and its memo pages at 25.8-72.5; item 795's
 # tariff runs to a median of 55.9 overall with rate sheets far below it.
@@ -82,6 +95,12 @@ ROW_NUMERIC_RUN = 3
 # or the whole page is header. Cap rather than prepend hundreds of lines to
 # every chunk on the page.
 MAX_HEADER_LINES = 30
+
+# A title block names the schedule, company, and units in a handful of lines.
+# Beyond this the "header" is the page, and prepending it to every chunk buries
+# the rows it was meant to caption. The page is chunked as prose instead, which
+# is what it was.
+MAX_HEADER_CHARS = 700
 
 TARGET_CHARS = 1200
 MAX_CHARS = 2000
@@ -163,6 +182,11 @@ class Line:
     def is_blank(self) -> bool:
         return not self.text.strip()
 
+    @property
+    def is_pleading_number(self) -> bool:
+        """A bare 1-25 from a testimony margin. Page furniture, not content."""
+        return bool(PLEADING_LINE_RE.match(self.text))
+
 
 def split_lines(text: str, start: int, end: int) -> list[Line]:
     """Lines of a region, each carrying its absolute offsets in the document."""
@@ -172,6 +196,11 @@ def split_lines(text: str, start: int, end: int) -> list[Line]:
         lines.append(Line(raw, cursor, cursor + len(raw)))
         cursor += len(raw) + 1
     return lines
+
+
+def content_lines(lines: list[Line]) -> list[Line]:
+    """Lines carrying content: neither blank nor margin numbering."""
+    return [l for l in lines if not l.is_blank and not l.is_pleading_number]
 
 
 def is_navigation(lines: list[Line]) -> bool:
@@ -203,7 +232,7 @@ def classify_page(lines: list[Line]) -> PageKind:
     A median ignores a fixed number of outlying lines by construction, which is
     exactly what a page header is.
     """
-    content = [l for l in lines if not l.is_blank]
+    content = content_lines(lines)
     if not content:
         return PageKind.PROSE
     if is_navigation(lines):
@@ -254,15 +283,23 @@ def group_rows(lines: list[Line]) -> list[list[Line]]:
 
 
 def _render(lines: list[Line]) -> str:
-    return "\n".join(l.text.strip() for l in lines if l.text.strip())
+    """Chunk text, with margin numbering dropped.
+
+    A chunk reading "1 / Q. / 2 / A. / 3" is mostly furniture, and those digits
+    would satisfy a numeric claim about anything.
+    """
+    return "\n".join(l.text.strip() for l in content_lines(lines))
 
 
 def chunk_table_page(
     lines: list[Line], span: PageSpan, document_id: str, start_ordinal: int
 ) -> list[Chunk]:
     header_end = find_header_end(lines)
-    header_lines = [l for l in lines[:header_end] if not l.is_blank]
+    header_lines = content_lines(lines[:header_end])
     header = _render(header_lines)
+    if len(header) > MAX_HEADER_CHARS:
+        # No title block was found, so this page is not a table after all.
+        return chunk_prose_page(lines, span, document_id, start_ordinal)
     header_range = (
         (header_lines[0].start, header_lines[-1].end) if header_lines else (None, None)
     )
@@ -387,7 +424,7 @@ def verify_chunk_spans(extracted: ExtractedDocument, chunks: list[Chunk]) -> Non
                     f"chunk {chunk.ordinal} span ({start}, {end}) outside document"
                 )
         body = extracted.text[chunk.char_start : chunk.char_end]
-        rendered = "\n".join(l.strip() for l in body.split("\n") if l.strip())
+        rendered = _render(split_lines(body, 0, len(body)))
         if rendered != chunk.body.strip():
             raise AssertionError(
                 f"chunk {chunk.ordinal} body does not match its recorded span"
