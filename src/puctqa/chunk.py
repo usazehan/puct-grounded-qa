@@ -198,9 +198,19 @@ def split_lines(text: str, start: int, end: int) -> list[Line]:
     return lines
 
 
-def content_lines(lines: list[Line]) -> list[Line]:
-    """Lines carrying content: neither blank nor margin numbering."""
-    return [l for l in lines if not l.is_blank and not l.is_pleading_number]
+def content_lines(lines: list[Line], drop_pleading: bool = True) -> list[Line]:
+    """Lines carrying content: neither blank nor margin numbering.
+
+    `drop_pleading` must be False on table pages. A bare one- or two-digit line
+    is margin numbering in testimony and a CELL VALUE in a rate schedule: the
+    monthly kWh column of item 795-A's street lighting table reads 70, 98, 159,
+    367, and dropping those removes the answer from the chunk that is supposed
+    to contain it. The filter is about page furniture, and what counts as
+    furniture depends on the page.
+    """
+    if drop_pleading:
+        return [l for l in lines if not l.is_blank and not l.is_pleading_number]
+    return [l for l in lines if not l.is_blank]
 
 
 def is_navigation(lines: list[Line]) -> bool:
@@ -282,21 +292,22 @@ def group_rows(lines: list[Line]) -> list[list[Line]]:
     return rows
 
 
-def _render(lines: list[Line]) -> str:
-    """Chunk text, with margin numbering dropped.
+def _render(lines: list[Line], drop_pleading: bool = True) -> str:
+    """Chunk text, with margin numbering dropped on prose pages.
 
-    A chunk reading "1 / Q. / 2 / A. / 3" is mostly furniture, and those digits
-    would satisfy a numeric claim about anything.
+    A prose chunk reading "1 / Q. / 2 / A. / 3" is mostly furniture, and those
+    digits would satisfy a numeric claim about anything. On a table page the
+    same digits are cell values -- see content_lines.
     """
-    return "\n".join(l.text.strip() for l in content_lines(lines))
+    return "\n".join(l.text.strip() for l in content_lines(lines, drop_pleading))
 
 
 def chunk_table_page(
     lines: list[Line], span: PageSpan, document_id: str, start_ordinal: int
 ) -> list[Chunk]:
     header_end = find_header_end(lines)
-    header_lines = content_lines(lines[:header_end])
-    header = _render(header_lines)
+    header_lines = content_lines(lines[:header_end], drop_pleading=False)
+    header = _render(header_lines, drop_pleading=False)
     if len(header) > MAX_HEADER_CHARS:
         # No title block was found, so this page is not a table after all.
         return chunk_prose_page(lines, span, document_id, start_ordinal)
@@ -304,7 +315,7 @@ def chunk_table_page(
         (header_lines[0].start, header_lines[-1].end) if header_lines else (None, None)
     )
 
-    rows = group_rows(lines[header_end:])
+    rows = group_rows(content_lines(lines[header_end:], drop_pleading=False))
     chunks: list[Chunk] = []
     batch: list[list[Line]] = []
     size = 0
@@ -318,7 +329,11 @@ def chunk_table_page(
             Chunk(
                 document_id=document_id,
                 ordinal=start_ordinal + len(chunks),
-                text=(header + "\n\n" + _render(flat)) if header else _render(flat),
+                text=(
+                    header + "\n\n" + _render(flat, drop_pleading=False)
+                    if header
+                    else _render(flat, drop_pleading=False)
+                ),
                 char_start=flat[0].start,
                 char_end=flat[-1].end,
                 page_start=span.page_number,
@@ -424,7 +439,13 @@ def verify_chunk_spans(extracted: ExtractedDocument, chunks: list[Chunk]) -> Non
                     f"chunk {chunk.ordinal} span ({start}, {end}) outside document"
                 )
         body = extracted.text[chunk.char_start : chunk.char_end]
-        rendered = _render(split_lines(body, 0, len(body)))
+        # Rendered by the same rules the chunker used, including whether margin
+        # numbering was dropped. A second hand-rolled rendering here would drift
+        # from the first, and the mismatch would look like an offset bug.
+        rendered = _render(
+            split_lines(body, 0, len(body)),
+            drop_pleading=chunk.kind is not PageKind.TABLE,
+        )
         if rendered != chunk.body.strip():
             raise AssertionError(
                 f"chunk {chunk.ordinal} body does not match its recorded span"
