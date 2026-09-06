@@ -1,0 +1,65 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pytest
+
+      - name: Run tests
+        # No network, no database, no model weights. The suite covers
+        # extraction, chunking, evidence segmentation, the grounding guard, and
+        # claim proposal through the echo backend -- everything except the two
+        # steps that need something outside the repository.
+        run: PYTHONPATH=src python -m pytest -q
+
+      - name: Probe the sample corpus
+        # data/sample holds synthetic fixtures rather than real filings, so this
+        # runs for anyone who has cloned the repository and downloaded nothing.
+        # It also proves the extraction path works end to end, which the unit
+        # tests exercise piecewise.
+        run: PYTHONPATH=src python scripts/probe_extraction.py data/sample
+
+      - name: Check the eval question set parses
+        # The question set is hand-written and edited by hand, so a stray comma
+        # is a real failure mode. Every entry needs an id, a category, an
+        # expected answer, and -- unless it is a refusal or a qualified set -- a
+        # source document and page.
+        run: |
+          PYTHONPATH=src python - <<'EOF'
+          import json
+          from pathlib import Path
+
+          rows = [
+              json.loads(line)
+              for line in Path("evals/questions.jsonl").read_text().splitlines()
+              if line.strip()
+          ]
+          ids = [r["id"] for r in rows]
+          assert len(set(ids)) == len(ids), "duplicate question ids"
+
+          for r in rows:
+              for field in ("id", "question", "expected_answer", "category"):
+                  assert r.get(field), f"{r.get('id')}: missing {field}"
+              refusal = r["expected_answer"].startswith("REFUSE_")
+              qualified = r.get("answer_mode") == "ANSWER_QUALIFIED_SET"
+              if refusal or qualified:
+                  continue
+              assert r.get("source_document"), f"{r['id']}: no source document"
+              assert r.get("source_page"), f"{r['id']}: no source page"
+
+          print(f"{len(rows)} questions parse and validate")
+          EOF
