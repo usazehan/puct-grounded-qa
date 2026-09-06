@@ -7,3 +7,4 @@ data/raw/*
 .pytest_cache/
 data/native/*
 !data/native/.gitkeep
+data/eval_cache/

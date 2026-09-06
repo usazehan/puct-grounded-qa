@@ -4,12 +4,12 @@ Question answering over Texas Public Utility Commission rate-case filings, where
 **every factual claim is verified against a source span before the answer is
 returned**. When verification fails, the system refuses rather than guessing.
 
-> **Status: retrieval measured, guard half built.** Acquisition, extraction,
-> citation anchoring, extraction-fidelity measurement, schema, ingestion,
-> layout-aware chunking, embeddings, and hybrid retrieval are built and tested,
-> with a retrieval eval harness over a hand-written question set. The guard
-> verifies claims but nothing generates them yet, so the refusal questions are
-> unscored. See `DESIGN.md` for the full spec.
+> **Status: end to end.** A question retrieves chunks, segments them into
+> evidence units, has a model select the units supporting a claim, verifies each
+> claim against the units it selected, and answers with citations or refuses.
+> On a hand-written set of 15 questions it answers 12 of 12 answerable ones
+> correctly and refuses 3 of 3 that should be refused. Read the caveats on that
+> number below — it is small and I wrote it. See `DESIGN.md` for the full spec.
 
 ---
 
@@ -70,13 +70,30 @@ python scripts/ocr_accuracy.py data/raw data/native --json data/ocr_report.json
 python scripts/ingest.py data/raw --docket 49421 --verdicts data/ocr_report.json
 ```
 
-Then chunk, embed, and measure retrieval over the sets marked retrievable:
+Then chunk, embed, and measure:
 
 ```bash
 python scripts/chunk_corpus.py
 python scripts/embed_chunks.py
 python scripts/eval_retrieval.py --k 3 --show-misses
+python scripts/eval_answers.py --backend echo
 ```
+
+Everything above runs locally with no key. **Claim generation is the one step
+that needs one**, and there are three backends:
+
+```bash
+python scripts/answer.py --backend echo    "..."   # no key, no download, not smart
+python scripts/answer.py --backend ollama  "..."   # local; needs a pulled model
+export ANTHROPIC_API_KEY=...
+python scripts/answer.py --backend anthropic --show-evidence "..."
+```
+
+`echo` selects the first unit sharing a term with the question. It is not
+intelligent — it exists so the pipeline runs end to end with nothing installed,
+which is what lets the test suite cover the generator at all. Responses from the
+other two are cached under `data/eval_cache/`, so re-running the eval while
+tuning the guard neither pays for identical calls nor varies with sampling.
 
 ---
 
@@ -164,6 +181,96 @@ rather than from a guess about the file.
 
 ---
 
+## What it does end to end
+
+```
+question
+   │
+   ├─ hybrid retrieval over retrieval-eligible sets ──── top 5 chunks
+   │
+   ├─ segmentation ─────────────────────────────────── evidence units, each
+   │                                                    with document offsets
+   ├─ a model selects unit IDS from a closed list ───── never quotes text
+   │
+   ├─ the guard verifies each claim ─────────────────── span, figures, predicate
+   │
+   └─ answer with citations, or refuse
+```
+
+**The model never writes a span.** It selects ids; code resolves them to text
+and offsets recorded during segmentation. Asking a model to quote its source
+makes verbatim copying a capability requirement — a model that paraphrases
+fails span verification even when its claim is right, and the guard ends up
+compensating for model behaviour rather than for OCR damage. Selecting from a
+closed list makes exact quotation an invariant.
+
+Page headers are shown to the model and are **not** citable. A table row is six
+bare values — `Metal Halide (175w) $9.24 12,900 210 N/A 70` — and only the
+header says which is the T&D charge. Without it the model was handed the answer
+and declined, correctly. With the header citable, a claim could rest on a column
+heading, which asserts nothing. Context is for reading; spans are for citing.
+
+---
+
+## Results
+
+15 questions in `evals/questions.jsonl`, scored end to end:
+
+| | |
+|---|---|
+| answered correctly | **12 / 12** |
+| refused correctly | **3 / 3** |
+| wrongly refused | 0 |
+| wrongly answered | 0 |
+
+Retrieval measured separately, over 10 answerable questions:
+
+| config | recall@3 | MRR | recall@1 |
+|---|---|---|---|
+| lexical | 90% | 0.683 | 50% |
+| dense | 60% | 0.550 | 50% |
+| **hybrid** | **100%** | **0.833** | **70%** |
+
+**A wrongly answered question is never summed with a wrongly refused one.** A
+refusal wastes a reader's time; a wrong answer hands them a plausible figure
+they cannot distinguish from a correct one without doing the research
+themselves. Collapsing both into an accuracy figure would hide the difference
+this project exists to maintain.
+
+### What the number is worth
+
+Fifteen questions, written by me, sourced from searches I ran while building the
+thing being tested. It measures the paths I knew to look at.
+
+**Two questions were relabelled after seeing the system's output.** I wrote
+"What is the residential PBRAF?" as a refusal, assuming a system facing three
+values across three schedules would have to pick one. It enumerated them with
+attribution instead — *"Under Schedule SRC, 64.9176%; under Sheet 6.7.5, ..."* —
+which resolves the ambiguity rather than guessing at it, and is a better answer
+than declining. The taxonomy was wrong, not the system, but relabelling a
+question after reading the output is grading adjacent to the answer and should
+be read as such.
+
+That correction produced a distinction worth keeping:
+
+| mode | when |
+|---|---|
+| `ANSWER_SINGLE` | one figure |
+| `ANSWER_QUALIFIED_SET` | several figures that vary along a stable qualifier — schedule, or who proposed it — so enumeration answers the question |
+| `REFUSE_NO_SUPPORT` | the corpus is silent |
+| `REFUSE_UNRESOLVABLE` | values conflict under the same qualifier, with nothing to choose between them |
+
+The residential PBRAF varies by schedule and is answerable. The LOS-A charge is
+`$0.000000` on two sheets and `$0.430730` on a third with nothing to distinguish
+them, and is not. Same surface shape, opposite correct behaviour.
+
+Qualified sets are scored **per claim**, not over the joined text: each figure
+must appear in the same claim as its qualifier. *"Schedules SRC and 6.7.2 report
+40.4859% and 64.9176%"* contains every required substring with the values
+swapped, and fails — which is the misattribution check applied to the grader.
+
+---
+
 ## Retrieval
 
 817 chunks over the 6 retrieval-eligible sets, embedded with
@@ -231,7 +338,23 @@ predicate is a property of the passage, the figure is what must be in the span.
 
 All three are tested against hand-written claims from real corpus text, half
 correct and half wrong in ways that matter. No model is involved, which is the
-point — a verifier is testable before the thing it verifies exists.
+point — a verifier is testable before the thing it verifies exists, and it was
+built first for that reason.
+
+### What the guard does not catch
+
+**Contradiction between claims.** Each claim is verified against the evidence it
+selected, and nothing asks whether other retrieved evidence gives a different
+answer to the same question. The residential PBRAF case only came out right
+because the model volunteered all three schedules; one that picked a schedule
+and stopped would have passed every check with an incomplete answer.
+
+**Predicate vocabulary is hand-built and fitted to this docket.** It groups
+`agreed` with `approved` because in this Final Order they name the same figure,
+and separates `requested` from `recommended` from `settled` because those are
+10.4%, 9.45% and 9.4%. Getting that wrong the first way round produced a false
+refusal on the clearest question in the set. It is a word-set test standing in
+for a semantic one and does not generalise past this docket.
 
 ---
 
@@ -353,7 +476,9 @@ src/puctqa/
   extract.py     PDF extraction, page-offset mapping, anchor resolution
   filters.py     Stage 1 triage with auditable exclusion reasons
   chunk.py       layout-aware chunking; prose by budget, tables by row
+  evidence.py    chunks -> addressable units with document offsets
   retrieve.py    dense + lexical + trigram arms, fused by reciprocal rank
+  generate.py    claim proposal; echo, ollama and anthropic backends
   guard.py       span, numeric, and predicate verification
 scripts/
   build_manifest.py      export -> manifest; merges, never overwrites assertions
@@ -363,6 +488,8 @@ scripts/
   chunk_corpus.py        chunk the eligible sets and persist with spans
   embed_chunks.py        embed persisted chunks; records the model per row
   eval_retrieval.py      recall and MRR per configuration and category
+  answer.py              one question, end to end
+  eval_answers.py        the whole pipeline against the question set
   find_answers.py        search the eligible corpus while writing questions
 migrations/
   001_init.sql           filings, documents, chunks, claims, eval tables
@@ -382,10 +509,11 @@ tests/                   no network or DB required
       schema, ingestion, chunking
 - [x] **W2** Embeddings, hybrid retrieval over retrieval-eligible sets, eval
       harness and a first measured baseline
-- [ ] **W3** Grounding guard — span, numeric, and predicate verification are
-      built and tested; claim generation is not, so the refusal questions are
-      unscored
+- [x] **W3** Grounding guard, claim generation, and an end-to-end eval:
+      span, numeric and predicate verification; evidence units selected by id;
+      12/12 answered and 3/3 refused
 - [ ] **W4** Structured logging, cost accounting, CI, deploy, results table
+- [ ] Contradiction detection — see "What the guard does not catch"
 
 `evals/questions.jsonl` holds 15 questions with verified answers and citation
 anchors, growing 10–15 a week. **Five are refusals**, which is the category the
