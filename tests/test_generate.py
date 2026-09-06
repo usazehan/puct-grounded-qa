@@ -12,6 +12,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from puctqa.evidence import EvidenceUnit  # noqa: E402
@@ -197,3 +199,36 @@ def test_a_prompt_without_context_is_unchanged():
     prompt = build_prompt("What ROE was approved?", UNITS)
     assert "Page context" not in prompt
     assert "Valid ids: c17:e00, c17:e01" in prompt
+
+
+# --- Usage and cost ---
+
+
+def test_an_unknown_price_is_none_not_zero():
+    """A local model has no per-token rate. Reporting $0.00 would put a number
+    in a results table that means "not measured"."""
+    from puctqa.generate import Usage
+
+    local = Usage(input_tokens=4000, output_tokens=200, model=None)
+    assert local.cost_usd is None
+
+    unknown = Usage(input_tokens=4000, output_tokens=200, model="some-new-model")
+    assert unknown.cost_usd is None
+
+
+def test_a_known_price_is_computed_from_the_recorded_rate():
+    from puctqa.generate import PRICES_PER_MTOK, Usage
+
+    model = "claude-sonnet-4-6"
+    rate_in, rate_out = PRICES_PER_MTOK[model]
+    usage = Usage(input_tokens=1_000_000, output_tokens=1_000_000, model=model)
+
+    assert usage.cost_usd == pytest.approx(rate_in + rate_out)
+
+
+def test_latency_is_recorded_even_without_token_counts():
+    """A local model that answers in forty seconds is a different product from
+    one that answers in two, whatever the token count says."""
+    proposal = propose("What ROE was approved?", UNITS, echo_backend)
+    assert proposal.usage.latency_ms >= 0
+    assert proposal.usage.cost_usd is None

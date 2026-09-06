@@ -39,6 +39,8 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
+
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -47,7 +49,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import psycopg  # noqa: E402
 
 from puctqa.evidence import EvidenceUnit, segment_chunk  # noqa: E402
-from puctqa.generate import BACKENDS, ProposedClaim, propose  # noqa: E402
+from puctqa.generate import BACKENDS, ProposedClaim, Usage, propose  # noqa: E402
 from puctqa.guard import (  # noqa: E402
     Verification,
     verify_numbers,
@@ -85,7 +87,10 @@ class Answer:
     refusal_reason: str | None = None
     units_offered: int = 0
     hits: list[Hit] = field(default_factory=list)
-
+    usage: Usage = field(default_factory=Usage)
+    # Wall clock for the whole path -- retrieval, segmentation, generation and
+    # verification -- not just the model call. What a reader waits for.
+    latency_ms: int = 0
     @property
     def refused(self) -> bool:
         return not self.verified
@@ -130,9 +135,15 @@ def units_for(
 
 
 def answer(cur, question: str, backend, embed, top_k: int = DEFAULT_TOP_K) -> Answer:
+    started = time.perf_counter()
     hits = search(cur, question, embedding=embed(question), limit=top_k)
     if not hits:
-        return Answer(question, refusal_reason="nothing retrieved", hits=[])
+        return Answer(
+            question,
+            refusal_reason="nothing retrieved",
+            hits=[],
+            latency_ms=int((time.perf_counter() - started) * 1000),
+        )
 
     units, by_chunk, context = units_for(cur, hits)
     result = Answer(question, units_offered=len(units), hits=hits)
@@ -141,7 +152,9 @@ def answer(cur, question: str, backend, embed, top_k: int = DEFAULT_TOP_K) -> An
         return result
 
     proposal = propose(question, units, backend, context)
+    result.usage = proposal.usage
     if proposal.refused:
+        result.latency_ms = int((time.perf_counter() - started) * 1000)
         result.refusal_reason = (
             "the evidence does not support an answer"
             if not proposal.invalid_ids
@@ -155,24 +168,16 @@ def answer(cur, question: str, backend, embed, top_k: int = DEFAULT_TOP_K) -> An
         if not sources:
             continue
 
-        # Each unit is checked against the chunk it came from. Joining units
-        # into one string and looking for that as a contiguous passage asks
-        # whether text that was never adjacent appears adjacently -- it does
-        # not, and the check fails on evidence that is genuinely in the record.
-        # The guard's own docstring says never to verify against a
-        # concatenation; this is the composition path obeying it.
         spans_ok = all(
             verify_span(u.text, by_chunk[u.chunk_id].text)[0]
             for u in claim.units
             if u.chunk_id in by_chunk
         )
-        # Numbers and predicate DO look at the joined evidence: they ask whether
-        # a figure or a word appears anywhere in what was cited, not whether it
-        # appears contiguously.
-        context = "\n\n".join(h.text for h in sources)
+
+        context_text = "\n\n".join(h.text for h in sources)
         numbers_ok, missing = verify_numbers(claim.assertion, claim.quoted_span)
         predicate_ok, predicate_detail = verify_predicate(
-            claim.assertion, claim.quoted_span, context
+            claim.assertion, claim.quoted_span, context_text
         )
 
         detail = None
@@ -196,19 +201,45 @@ def answer(cur, question: str, backend, embed, top_k: int = DEFAULT_TOP_K) -> An
     if not result.verified:
         reasons = {r.verification.refusal_reason for r in result.rejected}
         result.refusal_reason = "; ".join(sorted(r for r in reasons if r))
+    result.latency_ms = int((time.perf_counter() - started) * 1000)
     return result
 
 
-def persist(cur, question: str, result: Answer) -> None:
+def config_label(backend: str, model: str | None, top_k: int) -> str:
+    """Which configuration produced this run.
+
+    A free-form label rather than a foreign key, so comparing an ollama run
+    against an anthropic one is a GROUP BY rather than a schema change.
+    """
+    return f"{backend}:{model or 'default'}/k{top_k}"
+
+
+def persist(cur, question: str, result: Answer, config_id: str) -> None:
     """Record the question and every claim, verified or not.
 
     A refusal with no record is indistinguishable from a question nobody asked,
     and the results table needs to say how often the system refused and why.
     """
+    answer_text = " ".join(r.claim.assertion for r in result.verified) or None
+    top = max((h.score for h in result.hits), default=None)
     cur.execute(
-        "INSERT INTO queries (question, refused, refusal_reason) VALUES (%s, %s, %s) "
-        "RETURNING id",
-        (question, result.refused, result.refusal_reason),
+        """
+        INSERT INTO queries (question, answer, refused, refusal_reason,
+                             config_id, top_similarity, latency_ms,
+                             input_tokens, output_tokens, cost_usd)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        RETURNING id
+        """,
+        (
+            question, answer_text, result.refused, result.refusal_reason,
+            config_id, top, result.latency_ms,
+            result.usage.input_tokens or None,
+            result.usage.output_tokens or None,
+            # None rather than zero when the price is unknown: a local model has
+            # no per-token rate, and $0.00 in a results table reads as "free"
+            # rather than "not measured".
+            result.usage.cost_usd,
+        ),
     )
     query_id = cur.fetchone()[0]
 
@@ -262,11 +293,22 @@ def main() -> int:
     with psycopg.connect(args.dsn) as conn, conn.cursor() as cur:
         result = answer(cur, args.question, backend, embed, args.top_k)
         if not args.no_persist:
-            persist(cur, args.question, result)
+            persist(cur, args.question, result,
+                    config_label(args.backend, args.model, args.top_k))
             conn.commit()
 
+    cost = result.usage.cost_usd
     print(f"Q: {args.question}")
     print(f"   {len(result.hits)} chunks retrieved, {result.units_offered} evidence units")
+    print(
+        f"   {result.latency_ms} ms"
+        + (
+            f", {result.usage.input_tokens} in / {result.usage.output_tokens} out"
+            if result.usage.input_tokens
+            else ""
+        )
+        + (f", ${cost:.5f}" if cost is not None else "")
+    )
     print()
 
     if result.refused:

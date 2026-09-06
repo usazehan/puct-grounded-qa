@@ -42,6 +42,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -55,7 +56,6 @@ from .evidence import EvidenceUnit
 RESPONSE_SCHEMA = {
     "type": "object",
     "properties": {
-        "reasoning": {"type": "string"},
         "status": {"type": "string", "enum": ["supported", "no_support"]},
         "claims": {
             "type": "array",
@@ -76,7 +76,7 @@ RESPONSE_SCHEMA = {
             },
         },
     },
-    "required": ["reasoning", "status", "claims"],
+    "required": ["status", "claims"],
     "additionalProperties": False,
 }
 
@@ -93,9 +93,7 @@ passage from a filing. Return JSON:
 
 or, when the units do not support an answer:
 
-  {"reasoning": "<one sentence: which units answer this, and why>",
-   "status": "supported",
-   "claims": [...]}
+  {"status": "no_support", "claims": []}
 
 Rules:
 - Use only the ids listed below. Never invent one.
@@ -112,6 +110,48 @@ Rules:
   gives them. Use the context to tell which column a figure belongs to, and
   cite the row.
 """
+
+
+# Per-million-token prices, input and output. Hard coded because a cost figure
+# whose rate nobody can see is not a cost figure, and because the alternative --
+# reading prices at runtime -- makes a recorded cost depend on when the report
+# was generated rather than on what the run actually did.
+PRICES_PER_MTOK: dict[str, tuple[float, float]] = {
+    "claude-sonnet-4-6": (3.00, 15.00),
+    "claude-haiku-4-5-20251001": (1.00, 5.00),
+}
+
+
+@dataclass
+class Usage:
+    """What one call cost, in tokens and seconds.
+
+    A backend that cannot report tokens leaves them at zero; the distinction
+    between "free" and "unmeasured" is carried by `model`, which is None for the
+    echo backend. Latency is measured for every backend, because a local model
+    that answers in forty seconds is a different product from one that answers
+    in two, whatever the token count says.
+    """
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    latency_ms: int = 0
+    model: str | None = None
+
+    @property
+    def cost_usd(self) -> float | None:
+        """None when the price is unknown, never zero.
+
+        A local model has no per-token price and an unrecognised model has no
+        price this file knows. Reporting either as $0.00 would put a number in a
+        results table that means "not measured".
+        """
+        rates = PRICES_PER_MTOK.get(self.model or "")
+        if rates is None:
+            return None
+        return (
+            self.input_tokens * rates[0] + self.output_tokens * rates[1]
+        ) / 1_000_000
 
 
 @dataclass
@@ -135,6 +175,7 @@ class Proposal:
     status: str  # supported | no_support
     claims: list[ProposedClaim] = field(default_factory=list)
     raw: str = ""
+    usage: Usage = field(default_factory=Usage)
     # Ids the model returned that were not in the supplied list. A well-formed
     # response has none; recorded rather than discarded, because a backend that
     # invents ids is a backend to stop using.
@@ -147,6 +188,11 @@ class Proposal:
 
 class Backend(Protocol):
     def __call__(self, prompt: str, unit_ids: list[str]) -> str: ...
+
+    # Set by the backend after each call. An attribute rather than a return
+    # value so the seam stays `str -> str` and a caller that does not care about
+    # cost is unaffected.
+    last_usage: Usage
 
 
 def render_units(units: list[EvidenceUnit]) -> str:
@@ -252,13 +298,33 @@ def propose(
         # as support either. Recorded so a run with a broken backend is
         # distinguishable from a run where the corpus was silent.
         return Proposal(status="no_support", raw=f"backend error: {exc}")
-    return parse_proposal(raw, units)
+    proposal = parse_proposal(raw, units)
+    proposal.usage = getattr(backend, "last_usage", Usage())
+    return proposal
 
 
 # --- Backends ---
 
 
-def echo_backend(prompt: str, unit_ids: list[str]) -> str:
+def _timed(fn):
+    """Record latency around a backend call."""
+
+    def wrapper(prompt: str, unit_ids: list[str]) -> str:
+        start = time.perf_counter()
+        try:
+            return fn(prompt, unit_ids)
+        finally:
+            inner = getattr(fn, "last_usage", None)
+            if inner is not None:
+                wrapper.last_usage = inner
+            wrapper.last_usage.latency_ms = int((time.perf_counter() - start) * 1000)
+
+    wrapper.last_usage = Usage()
+    fn.last_usage = Usage()
+    return wrapper
+
+
+def _echo(prompt: str, unit_ids: list[str]) -> str:
     """Deterministic stand-in. Not intelligent; it exercises the path.
 
     Selects the first unit whose text shares a distinctive token with the
@@ -284,6 +350,9 @@ def echo_backend(prompt: str, unit_ids: list[str]) -> str:
                 }
             )
     return json.dumps({"status": "no_support", "claims": []})
+
+
+echo_backend = _timed(_echo)
 
 
 def ollama_backend(
@@ -321,9 +390,17 @@ def ollama_backend(
             headers={"Content-Type": "application/json"},
         )
         with urllib.request.urlopen(request, timeout=300) as response:
-            return json.loads(response.read())["response"]
+            payload = json.loads(response.read())
+        # Ollama reports token counts; it has no price, so cost stays None.
+        call.last_usage = Usage(
+            input_tokens=payload.get("prompt_eval_count", 0),
+            output_tokens=payload.get("eval_count", 0),
+            latency_ms=call.last_usage.latency_ms,
+            model=None,
+        )
+        return payload["response"]
 
-    return call
+    return _timed(call)
 
 
 def anthropic_backend(
@@ -359,13 +436,28 @@ def anthropic_backend(
                 "anthropic-version": "2023-06-01",
             },
         )
-        with urllib.request.urlopen(request, timeout=120) as response:
-            payload = json.loads(response.read())
+        try:
+            with urllib.request.urlopen(request, timeout=120) as response:
+                payload = json.loads(response.read())
+        except urllib.error.HTTPError as exc:
+            # The API explains what it rejected; a bare status code does not.
+            # "HTTP Error 400" hid a message that said the credit balance was
+            # too low.
+            detail = exc.read().decode("utf-8", "replace")[:400]
+            raise RuntimeError(f"anthropic {exc.code}: {detail}") from exc
+
+        usage = payload.get("usage", {})
+        call.last_usage = Usage(
+            input_tokens=usage.get("input_tokens", 0),
+            output_tokens=usage.get("output_tokens", 0),
+            latency_ms=call.last_usage.latency_ms,
+            model=model,
+        )
         return "".join(
             block.get("text", "") for block in payload.get("content", [])
         )
 
-    return call
+    return _timed(call)
 
 
 BACKENDS: dict[str, Callable[..., Backend]] = {
@@ -377,6 +469,8 @@ BACKENDS: dict[str, Callable[..., Backend]] = {
 
 __all__ = [
     "BACKENDS",
+    "PRICES_PER_MTOK",
+    "Usage",
     "ProposedClaim",
     "Proposal",
     "anthropic_backend",
