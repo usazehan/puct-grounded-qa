@@ -91,8 +91,15 @@ def main() -> int:
     args = ap.parse_args()
 
     questions = load_questions(args.questions)
-    answerable = [q for q in questions if not q["expected_answer"].startswith("REFUSE_")]
     refusals = [q for q in questions if q["expected_answer"].startswith("REFUSE_")]
+    answerable = [
+        q for q in questions
+        if not q["expected_answer"].startswith("REFUSE_") and q.get("source_page")
+    ]
+    unscored = [
+        q for q in questions
+        if not q["expected_answer"].startswith("REFUSE_") and not q.get("source_page")
+    ]
 
     configs = args.config or list(CONFIGS)
     needs_dense = any(CONFIGS[c]["use_dense"] for c in configs)
@@ -171,6 +178,9 @@ def main() -> int:
     print(f"{len(refusals)} refusal questions are not scored here. They have no")
     print("source chunk to retrieve -- the corpus holds two irreconcilable values")
     print("or none at all -- and belong to the grounding guard, not to retrieval.")
+    if unscored:
+        print(f"{len(unscored)} question(s) have several valid sources and no single")
+        print("page for recall to reach. Page-level recall does not apply to them.")
     return 0
 
 

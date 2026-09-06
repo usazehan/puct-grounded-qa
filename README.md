@@ -7,9 +7,10 @@ returned**. When verification fails, the system refuses rather than guessing.
 > **Status: end to end.** A question retrieves chunks, segments them into
 > evidence units, has a model select the units supporting a claim, verifies each
 > claim against the units it selected, and answers with citations or refuses.
-> On a hand-written set of 15 questions it answers 12 of 12 answerable ones
-> correctly and refuses 3 of 3 that should be refused. Read the caveats on that
-> number below — it is small and I wrote it. See `DESIGN.md` for the full spec.
+> On a hand-written set of 23 questions it answers 17 of 20 answerable ones
+> correctly and refuses 3 of 3 that should be refused. Read the caveats below —
+> the set is small, I wrote it, and the three failures are more interesting than
+> the score. See `DESIGN.md` for the full spec.
 
 ---
 
@@ -214,22 +215,29 @@ heading, which asserts nothing. Context is for reading; spans are for citing.
 
 ## Results
 
-15 questions in `evals/questions.jsonl`, scored end to end:
+23 questions in `evals/questions.jsonl`, scored end to end:
 
 | | |
 |---|---|
-| answered correctly | **12 / 12** |
+| answered correctly | **17 / 20** |
 | refused correctly | **3 / 3** |
-| wrongly refused | 0 |
-| wrongly answered | 0 |
+| wrongly refused | 1 |
+| wrongly answered | 2 |
 
-Retrieval measured separately, over 10 answerable questions:
+Retrieval measured separately, over the 18 questions with a single source page:
 
-| config | recall@3 | MRR | recall@1 |
-|---|---|---|---|
-| lexical | 90% | 0.683 | 50% |
-| dense | 60% | 0.550 | 50% |
-| **hybrid** | **100%** | **0.833** | **70%** |
+| config | recall@3 | MRR |
+|---|---|---|
+| lexical | 78% | 0.602 |
+| dense | 56% | 0.426 |
+| **hybrid** | **83%** | **0.657** |
+
+**Prose retrieves worse than figures.** Every question naming a figure or an
+acronym retrieves at 100%; questions about what a witness argued sit at 60% for
+hybrid and 40% for dense. A question like *"what metrics are monitored to
+determine short-term incentive payments"* has no distinctive token to match and
+no distinctive figure to embed near, and roughly half of what these filings
+contain is argument rather than numbers.
 
 **A wrongly answered question is never summed with a wrongly refused one.** A
 refusal wastes a reader's time; a wrong answer hands them a plausible figure
@@ -237,10 +245,27 @@ they cannot distinguish from a correct one without doing the research
 themselves. Collapsing both into an accuracy figure would hide the difference
 this project exists to maintain.
 
+### The three failures
+
+**q019 — a retrieval miss.** The answer is on page 7 of Reed's rebuttal and
+retrieval returns pages 5, 14 and 20. Prose again.
+
+**q018 and q023 — verified, cited, and not answers.** Asked what Mr. Garrett's
+adjustment *consisted of*, the system explained his rationale instead: every
+word true, every word cited, and not the question. Asked why approval is in the
+public interest, it gave two of the three reasons the document lists and
+stopped.
+
+Nothing in the guard catches either. Verification asks whether a claim is
+supported by the evidence it cites; it never asks whether the claim answers the
+question, or whether it says everything the source says. That is the sharpest
+thing this eval has found, and it is a gap in the design rather than a bug —
+see "What the guard does not catch".
+
 ### What the number is worth
 
-Fifteen questions, written by me, sourced from searches I ran while building the
-thing being tested. It measures the paths I knew to look at.
+Twenty-three questions, written by me, sourced from searches I ran while
+building the thing being tested. It measures the paths I knew to look at.
 
 **Two questions were relabelled after seeing the system's output.** I wrote
 "What is the residential PBRAF?" as a refusal, assuming a system facing three
@@ -348,6 +373,15 @@ selected, and nothing asks whether other retrieved evidence gives a different
 answer to the same question. The residential PBRAF case only came out right
 because the model volunteered all three schedules; one that picked a schedule
 and stopped would have passed every check with an incomplete answer.
+
+**Responsiveness and completeness.** Verification asks whether a claim is
+supported by its evidence. It never asks whether the claim answers the question
+asked, or whether it says everything the source says. Three questions in the
+eval set turn on this: one answered a different question than the one asked, one
+gave two of three reasons and stopped, and one would have passed with a single
+schedule out of three had the model not volunteered the rest. All three produce
+answers that are true, cited, and incomplete — which is a milder failure than a
+wrong figure, and still a failure.
 
 **Predicate vocabulary is hand-built and fitted to this docket.** It groups
 `agreed` with `approved` because in this Final Order they name the same figure,
@@ -513,7 +547,8 @@ tests/                   no network or DB required
       span, numeric and predicate verification; evidence units selected by id;
       12/12 answered and 3/3 refused
 - [ ] **W4** Structured logging, cost accounting, CI, deploy, results table
-- [ ] Contradiction detection — see "What the guard does not catch"
+- [ ] Contradiction detection, and responsiveness — see "What the guard does
+      not catch"
 
 `evals/questions.jsonl` holds 15 questions with verified answers and citation
 anchors, growing 10–15 a week. **Five are refusals**, which is the category the
