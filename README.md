@@ -1,4 +1,5 @@
 # Grounded QA over Texas PUC Utility Filings
+![tests](https://github.com/usazehan/puct-grounded-qa/actions/workflows/tests.yml/badge.svg)
 
 Question answering over Texas Public Utility Commission rate-case filings, where
 **every factual claim is verified against a source span before the answer is
