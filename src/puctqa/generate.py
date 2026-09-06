@@ -55,6 +55,7 @@ from .evidence import EvidenceUnit
 RESPONSE_SCHEMA = {
     "type": "object",
     "properties": {
+        "reasoning": {"type": "string"},
         "status": {"type": "string", "enum": ["supported", "no_support"]},
         "claims": {
             "type": "array",
@@ -75,7 +76,7 @@ RESPONSE_SCHEMA = {
             },
         },
     },
-    "required": ["status", "claims"],
+    "required": ["reasoning", "status", "claims"],
     "additionalProperties": False,
 }
 
@@ -92,7 +93,9 @@ passage from a filing. Return JSON:
 
 or, when the units do not support an answer:
 
-  {"status": "no_support", "claims": []}
+  {"reasoning": "<one sentence: which units answer this, and why>",
+   "status": "supported",
+   "claims": [...]}
 
 Rules:
 - Use only the ids listed below. Never invent one.
@@ -105,6 +108,9 @@ Rules:
 - Return no_support when the units are silent on the question, when they give
   two irreconcilable answers, or when answering would need a figure that is not
   there. Refusing is a correct answer.
+- A table row is a label followed by its columns, in the order the page context
+  gives them. Use the context to tell which column a figure belongs to, and
+  cite the row.
 """
 
 
@@ -147,13 +153,32 @@ def render_units(units: list[EvidenceUnit]) -> str:
     return "\n".join(f"[{u.unit_id}] {u.text}" for u in units)
 
 
-def build_prompt(question: str, units: list[EvidenceUnit]) -> str:
-    return (
-        f"{INSTRUCTIONS}\n"
-        f"Question: {question}\n\n"
-        f"Evidence units:\n{render_units(units)}\n\n"
-        f"Valid ids: {', '.join(u.unit_id for u in units)}\n"
-    )
+def build_prompt(
+    question: str,
+    units: list[EvidenceUnit],
+    context: dict[int, str] | None = None,
+) -> str:
+    """Assemble the request.
+
+    `context` maps a chunk id to its page header. Headers are shown but never
+    listed as valid ids: a table row is six bare values, and only the header
+    says which is the charge and which is the lumen rating -- but a claim
+    citing a column heading asserts nothing, so it must not be citable.
+    """
+    parts = [INSTRUCTIONS, f"Question: {question}", ""]
+    if context:
+        parts.append(
+            "Page context (read this to interpret the units; it is NOT "
+            "citable and has no ids):"
+        )
+        for chunk_id, header in context.items():
+            if header:
+                parts.append(f"  chunk c{chunk_id}: {' | '.join(header.split(chr(10)))}")
+        parts.append("")
+    parts.append(f"Evidence units:\n{render_units(units)}")
+    parts.append("")
+    parts.append(f"Valid ids: {', '.join(u.unit_id for u in units)}")
+    return "\n".join(parts) + "\n"
 
 
 def _extract_json(text: str) -> dict:
@@ -211,10 +236,15 @@ def parse_proposal(raw: str, units: list[EvidenceUnit]) -> Proposal:
     )
 
 
-def propose(question: str, units: list[EvidenceUnit], backend: Backend) -> Proposal:
+def propose(
+    question: str,
+    units: list[EvidenceUnit],
+    backend: Backend,
+    context: dict[int, str] | None = None,
+) -> Proposal:
     if not units:
         return Proposal(status="no_support", raw="")
-    prompt = build_prompt(question, units)
+    prompt = build_prompt(question, units, context)
     try:
         raw = backend(prompt, [u.unit_id for u in units])
     except Exception as exc:  # noqa: BLE001

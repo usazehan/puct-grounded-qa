@@ -171,3 +171,29 @@ def test_echo_is_deterministic():
     first = propose(question, UNITS, echo_backend)
     second = propose(question, UNITS, echo_backend)
     assert first.raw == second.raw
+
+
+# --- Page context ---
+
+
+def test_context_is_shown_but_not_citable():
+    """A table row is six bare values -- "$9.24 12,900 210 N/A 70" -- and only
+    the page header says which is the T&D charge. Without it the model was
+    shown the answer and declined, correctly. With it citable, a claim could
+    rest on a column heading, which asserts nothing."""
+    prompt = build_prompt(
+        "What is the T&D charge for a 175w metal halide?",
+        UNITS,
+        context={17: "TYPE OF LAMP\nT&D CHARGE\nLUMEN RATING\nMONTHLY KWH"},
+    )
+
+    assert "T&D CHARGE" in prompt
+    assert "NOT" in prompt and "citable" in prompt
+    # The header has no id, so the enum of valid ids cannot include it.
+    assert "Valid ids: c17:e00, c17:e01" in prompt
+
+
+def test_a_prompt_without_context_is_unchanged():
+    prompt = build_prompt("What ROE was approved?", UNITS)
+    assert "Page context" not in prompt
+    assert "Valid ids: c17:e00, c17:e01" in prompt

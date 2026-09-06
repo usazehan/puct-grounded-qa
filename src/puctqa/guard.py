@@ -69,8 +69,18 @@ SPAN_SIMILARITY_FLOOR = 0.85
 CONTESTED_PREDICATES = {
     "requested": {"request", "requested", "sought", "proposed", "initially"},
     "recommended": {"recommend", "recommended", "recommendation", "proposal"},
-    "agreed": {"agreed", "agreement", "stipulated", "signatories", "settlement"},
-    "approved": {"approved", "approves", "ordered", "orders", "must", "adopted"},
+    # "agreed" and "approved" name the SAME figure in this docket: the
+    # signatories agreed to 9.4% and the Commission approved the agreement, in
+    # one document. Separating them refused the corpus's clearest question --
+    # a claim saying "the Final Order approved 9.4%" over a span saying "the
+    # signatories agreed" is correct, not a misattribution.
+    #
+    # What carries different numbers is requested (10.4%) against recommended
+    # (9.45%) against settled (9.4%). Those are the groups worth contesting.
+    "settled": {
+        "agreed", "agreement", "stipulated", "signatories", "settlement",
+        "approved", "approves", "adopted", "ordered", "orders", "must",
+    },
     "current": {"current", "currently", "existing", "present"},
 }
 

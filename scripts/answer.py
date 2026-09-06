@@ -1,0 +1,298 @@
+#!/usr/bin/env python3
+"""Answer a question, or refuse.
+
+The whole path in one place: retrieve chunks from retrieval-eligible sets,
+segment them into evidence units, ask a backend to select the units supporting
+a claim, verify each claim against the units it selected, and keep only what
+survives.
+
+REFUSAL IS THE DEFAULT OUTCOME, NOT AN ERROR PATH
+
+A question is answered when at least one claim passes all three checks. Every
+other outcome is a refusal, and each one is recorded with its reason:
+
+    the backend selected no evidence          the corpus is silent, or the
+                                              passages disagree with each other
+    a claim asserted a figure not in its      the model wrote a number the
+      evidence                                evidence does not contain
+    a claim's predicate did not match         the evidence says "agreed" and the
+      its evidence                            claim says "requested"
+
+The middle two are the model being caught. The first is the model declining,
+which is the behaviour the instructions ask for and the thing worth measuring.
+
+WHAT IS PERSISTED
+
+Every claim, verified or not, with the span it rested on and which check failed.
+A refusal with no record is indistinguishable from a question nobody asked, and
+the results table this project is building toward needs to say how often the
+system refused and why.
+
+Usage:
+    python scripts/answer.py "What return on equity was approved?"
+    python scripts/answer.py --backend anthropic "What is the T&D charge for a 175w metal halide?"
+    python scripts/answer.py --backend echo --show-evidence "..."
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+import psycopg  # noqa: E402
+
+from puctqa.evidence import EvidenceUnit, segment_chunk  # noqa: E402
+from puctqa.generate import BACKENDS, ProposedClaim, propose  # noqa: E402
+from puctqa.guard import (  # noqa: E402
+    Verification,
+    verify_numbers,
+    verify_predicate,
+    verify_span,
+)
+from puctqa.retrieve import Hit, search  # noqa: E402
+
+DEFAULT_DSN = "postgresql://puctqa:puctqa@localhost:5432/puctqa"
+DEFAULT_EMBED_MODEL = "Qwen/Qwen3-Embedding-0.6B"
+DEFAULT_TOP_K = 5
+
+
+@dataclass
+class VerifiedClaim:
+    claim: ProposedClaim
+    verification: Verification
+    hit: Hit
+
+    @property
+    def citation(self) -> str:
+        return f"{self.hit.document} {self.hit.anchor_value}"
+
+    @property
+    def weakly_anchored(self) -> bool:
+        """A citation naming a position in a file, not in the record."""
+        return self.hit.anchor_scheme == "pdf_page"
+
+
+@dataclass
+class Answer:
+    question: str
+    verified: list[VerifiedClaim] = field(default_factory=list)
+    rejected: list[VerifiedClaim] = field(default_factory=list)
+    refusal_reason: str | None = None
+    units_offered: int = 0
+    hits: list[Hit] = field(default_factory=list)
+
+    @property
+    def refused(self) -> bool:
+        return not self.verified
+
+
+def units_for(
+    cur, hits: list[Hit]
+) -> tuple[list[EvidenceUnit], dict[int, Hit], dict[int, str]]:
+    """Segment each retrieved chunk, keeping the hit each unit came from.
+
+    Segmentation runs against the document text rather than the chunk's stored
+    text, because a unit's offsets must be document offsets -- a citation that
+    resolves into a chunk rather than into the filing is not checkable by a
+    reader holding the PDF.
+    """
+    units: list[EvidenceUnit] = []
+    by_chunk: dict[int, Hit] = {}
+    context: dict[int, str] = {}
+    for hit in hits:
+        cur.execute(
+            """
+            SELECT t.text, c.char_start, c.char_end, c.kind,
+                   c.context_char_start, c.context_char_end
+            FROM chunks c
+            JOIN document_text t ON t.document_id = c.document_id
+            WHERE c.id = %s
+            """,
+            (hit.chunk_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            continue
+        document_text, char_start, char_end, kind, ctx_start, ctx_end = row
+        units.extend(segment_chunk(hit.chunk_id, document_text, char_start, char_end, kind))
+        by_chunk[hit.chunk_id] = hit
+        if ctx_start is not None:
+            # The page header: column labels a reader needs to tell which
+            # figure in a row is the charge and which is the lumen rating.
+            # Shown to the model, never citable.
+            context[hit.chunk_id] = document_text[ctx_start:ctx_end]
+    return units, by_chunk, context
+
+
+def answer(cur, question: str, backend, embed, top_k: int = DEFAULT_TOP_K) -> Answer:
+    hits = search(cur, question, embedding=embed(question), limit=top_k)
+    if not hits:
+        return Answer(question, refusal_reason="nothing retrieved", hits=[])
+
+    units, by_chunk, context = units_for(cur, hits)
+    result = Answer(question, units_offered=len(units), hits=hits)
+    if not units:
+        result.refusal_reason = "retrieved chunks produced no evidence units"
+        return result
+
+    proposal = propose(question, units, backend, context)
+    if proposal.refused:
+        result.refusal_reason = (
+            "the evidence does not support an answer"
+            if not proposal.invalid_ids
+            else f"backend cited ids that were not offered: {proposal.invalid_ids}"
+        )
+        return result
+
+    for claim in proposal.claims:
+        chunk_ids = {u.chunk_id for u in claim.units}
+        sources = [by_chunk[cid] for cid in chunk_ids if cid in by_chunk]
+        if not sources:
+            continue
+
+        # Each unit is checked against the chunk it came from. Joining units
+        # into one string and looking for that as a contiguous passage asks
+        # whether text that was never adjacent appears adjacently -- it does
+        # not, and the check fails on evidence that is genuinely in the record.
+        # The guard's own docstring says never to verify against a
+        # concatenation; this is the composition path obeying it.
+        spans_ok = all(
+            verify_span(u.text, by_chunk[u.chunk_id].text)[0]
+            for u in claim.units
+            if u.chunk_id in by_chunk
+        )
+        # Numbers and predicate DO look at the joined evidence: they ask whether
+        # a figure or a word appears anywhere in what was cited, not whether it
+        # appears contiguously.
+        context = "\n\n".join(h.text for h in sources)
+        numbers_ok, missing = verify_numbers(claim.assertion, claim.quoted_span)
+        predicate_ok, predicate_detail = verify_predicate(
+            claim.assertion, claim.quoted_span, context
+        )
+
+        detail = None
+        if not spans_ok:
+            detail = "a cited unit is not in the chunk it came from"
+        elif not numbers_ok:
+            detail = f"figures absent from the evidence: {', '.join(missing)}"
+        elif not predicate_ok:
+            detail = predicate_detail
+
+        verification = Verification(
+            span_verified=spans_ok,
+            numbers_verified=numbers_ok,
+            predicate_supported=predicate_ok,
+            missing_numbers=missing,
+            failure_detail=detail,
+        )
+        record = VerifiedClaim(claim, verification, sources[0])
+        (result.verified if verification.verified else result.rejected).append(record)
+
+    if not result.verified:
+        reasons = {r.verification.refusal_reason for r in result.rejected}
+        result.refusal_reason = "; ".join(sorted(r for r in reasons if r))
+    return result
+
+
+def persist(cur, question: str, result: Answer) -> None:
+    """Record the question and every claim, verified or not.
+
+    A refusal with no record is indistinguishable from a question nobody asked,
+    and the results table needs to say how often the system refused and why.
+    """
+    cur.execute(
+        "INSERT INTO queries (question, refused, refusal_reason) VALUES (%s, %s, %s) "
+        "RETURNING id",
+        (question, result.refused, result.refusal_reason),
+    )
+    query_id = cur.fetchone()[0]
+
+    for record in result.verified + result.rejected:
+        v = record.verification
+        cur.execute(
+            """
+            INSERT INTO claims (
+                query_id, chunk_id, claim_text, quoted_span,
+                span_verified, numbers_verified, failure_detail,
+                anchor_scheme, anchor_value
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                query_id,
+                record.claim.chunk_id,
+                record.claim.assertion,
+                record.claim.quoted_span,
+                v.span_verified,
+                v.numbers_verified,
+                v.failure_detail,
+                record.hit.anchor_scheme,
+                record.hit.anchor_value,
+            ),
+        )
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("question")
+    ap.add_argument("--dsn", default=os.environ.get("PUCTQA_DSN", DEFAULT_DSN))
+    ap.add_argument("--backend", choices=list(BACKENDS), default="echo")
+    ap.add_argument("--model", default=None, help="backend-specific model name")
+    ap.add_argument("--embed-model", default=DEFAULT_EMBED_MODEL)
+    ap.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
+    ap.add_argument("--show-evidence", action="store_true")
+    ap.add_argument("--no-persist", action="store_true")
+    args = ap.parse_args()
+
+    factory = BACKENDS[args.backend]
+    backend = factory(model=args.model) if args.model else factory()
+
+    from sentence_transformers import SentenceTransformer
+
+    embedder = SentenceTransformer(args.embed_model, trust_remote_code=True)
+    embed = lambda text: embedder.encode(  # noqa: E731
+        text, normalize_embeddings=True
+    ).tolist()
+
+    with psycopg.connect(args.dsn) as conn, conn.cursor() as cur:
+        result = answer(cur, args.question, backend, embed, args.top_k)
+        if not args.no_persist:
+            persist(cur, args.question, result)
+            conn.commit()
+
+    print(f"Q: {args.question}")
+    print(f"   {len(result.hits)} chunks retrieved, {result.units_offered} evidence units")
+    print()
+
+    if result.refused:
+        print("REFUSED")
+        print(f"  {result.refusal_reason}")
+        if result.rejected:
+            print()
+            print("  Claims the backend proposed and the guard rejected:")
+            for record in result.rejected:
+                print(f"    {record.claim.assertion}")
+                print(f"      {record.verification.refusal_reason}")
+        return 0
+
+    for record in result.verified:
+        print(record.claim.assertion)
+        weak = "  [weakly anchored]" if record.weakly_anchored else ""
+        print(f"  — {record.citation}{weak}")
+        if args.show_evidence:
+            for unit in record.claim.units:
+                print(f"    [{unit.unit_id}] {unit.text[:160]}")
+        print()
+
+    if result.rejected:
+        print(f"({len(result.rejected)} further claim(s) failed verification)")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
