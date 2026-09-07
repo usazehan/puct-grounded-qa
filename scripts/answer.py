@@ -52,6 +52,7 @@ from puctqa.evidence import EvidenceUnit, segment_chunk  # noqa: E402
 from puctqa.generate import BACKENDS, ProposedClaim, Usage, propose  # noqa: E402
 from puctqa.guard import verify_claim_over_units  # noqa: E402
 from puctqa.retrieve import Hit, search  # noqa: E402
+from puctqa.review import Review, review  # noqa: E402
 
 DEFAULT_DSN = "postgresql://puctqa:puctqa@localhost:5432/puctqa"
 DEFAULT_EMBED_MODEL = "Qwen/Qwen3-Embedding-0.6B"
@@ -83,6 +84,7 @@ class Answer:
     units_offered: int = 0
     hits: list[Hit] = field(default_factory=list)
     usage: Usage = field(default_factory=Usage)
+    review: Review = field(default_factory=Review)
     # Wall clock for the whole path -- retrieval, segmentation, generation and
     # verification -- not just the model call. What a reader waits for.
     latency_ms: int = 0
@@ -129,7 +131,7 @@ def units_for(
     return units, by_chunk, context
 
 
-def answer(cur, question: str, backend, embed, top_k: int = DEFAULT_TOP_K) -> Answer:
+def answer(cur, question: str, backend, embed, top_k: int = DEFAULT_TOP_K, do_review: bool = True) -> Answer:
     started = time.perf_counter()
     hits = search(cur, question, embedding=embed(question), limit=top_k)
     if not hits:
@@ -165,10 +167,7 @@ def answer(cur, question: str, backend, embed, top_k: int = DEFAULT_TOP_K) -> An
         }
         if not sources:
             continue
-        # Each unit paired with the chunk it came from. The composition lives in
-        # guard.verify_claim_over_units, not here: joining the units and
-        # checking the join was written wrong three times in this file, and the
-        # guard's tests could not reach it while it lived in a script.
+
         evidence = [
             (u.text, by_chunk[u.chunk_id].text)
             for u in claim.units
@@ -181,6 +180,26 @@ def answer(cur, question: str, backend, embed, top_k: int = DEFAULT_TOP_K) -> An
     if not result.verified:
         reasons = {r.verification.refusal_reason for r in result.rejected}
         result.refusal_reason = "; ".join(sorted(r for r in reasons if r))
+        
+    if result.verified and do_review:
+        cited = [u for r in result.verified for u in r.claim.units]
+        result.review = review(
+            question,
+            [r.claim.assertion for r in result.verified],
+            cited,
+            units,
+            backend,
+        )
+        review_usage = getattr(backend, "last_usage", None)
+        if review_usage is not None and review_usage is not result.usage:
+            result.usage = Usage(
+                input_tokens=result.usage.input_tokens + review_usage.input_tokens,
+                output_tokens=result.usage.output_tokens + review_usage.output_tokens,
+                latency_ms=result.usage.latency_ms + review_usage.latency_ms,
+                model=result.usage.model or review_usage.model,
+            )
+    if result.review.caveat:
+        print(f"⚠ {result.review.caveat}")
     result.latency_ms = int((time.perf_counter() - started) * 1000)
     return result
 
@@ -215,9 +234,6 @@ def persist(cur, question: str, result: Answer, config_id: str) -> None:
             config_id, top, result.latency_ms,
             result.usage.input_tokens or None,
             result.usage.output_tokens or None,
-            # None rather than zero when the price is unknown: a local model has
-            # no per-token rate, and $0.00 in a results table reads as "free"
-            # rather than "not measured".
             result.usage.cost_usd,
         ),
     )
@@ -258,6 +274,7 @@ def main() -> int:
     ap.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
     ap.add_argument("--show-evidence", action="store_true")
     ap.add_argument("--no-persist", action="store_true")
+    ap.add_argument("--no-review", action="store_true")
     args = ap.parse_args()
 
     factory = BACKENDS[args.backend]
