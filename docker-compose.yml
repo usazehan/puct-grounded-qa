@@ -21,11 +21,13 @@ services:
     depends_on:
       db:
         condition: service_healthy
+    command: uvicorn puctqa.api:app --host 0.0.0.0 --port 8000
     environment:
-      DATABASE_URL: postgresql://puctqa:puctqa@db:5432/puctqa
+      PUCTQA_DSN: postgresql://puctqa:puctqa@db:5432/puctqa
+      PUCTQA_BACKEND: ${PUCTQA_BACKEND:-echo}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       CORPUS_DIR: /app/data/raw
       SOURCE_HTTP_ENABLED: "false"
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
     ports:
       - "8000:8000"
     volumes:
