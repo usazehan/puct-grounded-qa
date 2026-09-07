@@ -388,22 +388,57 @@ correct and half wrong in ways that matter. No model is involved, which is the
 point — a verifier is testable before the thing it verifies exists, and it was
 built first for that reason.
 
+### A fourth check, different in kind
+
+Verification asks whether a claim is supported by its evidence. It never asks
+whether the claim answers the question, or whether it says what the evidence
+says. Three eval questions turned on that: one explained a witness's rationale
+when asked what his adjustment consisted of, one gave two of three reasons and
+stopped, and one would have named a single schedule out of three had the model
+not volunteered the rest. All three are true, cited, and not what a reader
+needed.
+
+So there is a review pass (`src/puctqa/review.py`) that judges two things after
+verification: **responsive** — does this answer the question asked — and
+**complete** — does it say what the evidence says. It sees the retrieved units
+the answer did *not* cite, which is the point: a partial answer's omission is
+sitting in the evidence the claim declined to select.
+
+**This is a model grading a model**, which the rest of the design avoids. The
+three guard checks are deterministic — anyone can rerun them and a reader who
+disagrees can look at the span. "Does this answer the question" is not
+mechanically decidable. Three constraints follow, and they are why the pass is
+safe to have rather than a hole in the argument:
+
+- it runs **after** verification, never instead; an unsupported claim is
+  rejected by the guard and never reaches it
+- it **downgrades only** — it can qualify a verified answer, never rescue a
+  rejected one
+- an unparseable review is recorded as **unreviewed, not clean**, and
+  `Review.reviewed` is stored separately so a results table can report the
+  deterministic checks apart from this one
+
+Validated against a deliberately truncated answer over real corpus text: given
+one of the three reasons approval is said to be in the public interest, it
+returned `complete: false` and named the two omitted reasons with their unit
+ids.
+
+It is not free. A reviewed answer costs about **$0.025 against $0.012** and
+takes about **21 s against 3 s** — the review reasons more than the generation
+does. Whether that is worth paying on every query, or only on multi-claim
+answers, is not yet measured.
+
+---
+
 ### What the guard does not catch
 
 **Contradiction between claims.** Each claim is verified against the evidence it
-selected, and nothing asks whether other retrieved evidence gives a different
-answer to the same question. The residential PBRAF case only came out right
-because the model volunteered all three schedules; one that picked a schedule
-and stopped would have passed every check with an incomplete answer.
-
-**Responsiveness and completeness.** Verification asks whether a claim is
-supported by its evidence. It never asks whether the claim answers the question
-asked, or whether it says everything the source says. Three questions in the
-eval set turn on this: one answered a different question than the one asked, one
-gave two of three reasons and stopped, and one would have passed with a single
-schedule out of three had the model not volunteered the rest. All three produce
-answers that are true, cited, and incomplete — which is a milder failure than a
-wrong figure, and still a failure.
+selected, and nothing deterministic asks whether other retrieved evidence gives
+a different answer to the same question. The review pass above is the closest
+thing to a check on this, and it is a model's judgement rather than a rule.
+Knowing that 40.4859% and 64.9176% are competing answers requires understanding
+that both are residential PBRAFs from different schedules — which needs schedule
+metadata this corpus does not carry in any structured form.
 
 **Predicate vocabulary is hand-built and fitted to this docket.** It groups
 `agreed` with `approved` because in this Final Order they name the same figure,
@@ -536,6 +571,7 @@ src/puctqa/
   retrieve.py    dense + lexical + trigram arms, fused by reciprocal rank
   generate.py    claim proposal; echo, ollama and anthropic backends
   guard.py       span, numeric, and predicate verification
+  review.py      responsiveness and completeness; model-based, downgrades only
 scripts/
   build_manifest.py      export -> manifest; merges, never overwrites assertions
   probe_extraction.py    corpus report + threshold calibration
@@ -569,8 +605,10 @@ tests/                   no network or DB required
       span, numeric and predicate verification; evidence units selected by id;
       12/12 answered and 3/3 refused
 - [ ] **W4** Structured logging, cost accounting, CI, deploy, results table
-- [ ] Contradiction detection, and responsiveness — see "What the guard does
-      not catch"
+- [x] Review pass for responsiveness and completeness — model-based, and
+      documented as such
+- [ ] Contradiction detection — needs schedule metadata the corpus does not
+      carry; see "What the guard does not catch"
 
 `evals/questions.jsonl` holds 15 questions with verified answers and citation
 anchors, growing 10–15 a week. **Five are refusals**, which is the category the
