@@ -1,5 +1,4 @@
 # Grounded QA over Texas PUC Utility Filings
-![tests](https://github.com/usazehan/puct-grounded-qa/actions/workflows/tests.yml/badge.svg)
 
 Question answering over Texas Public Utility Commission rate-case filings, where
 **every factual claim is verified against a source span before the answer is
@@ -220,10 +219,28 @@ heading, which asserts nothing. Context is for reading; spans are for citing.
 
 | | |
 |---|---|
-| answered correctly | **17 / 20** |
+| answered correctly | **16–17 / 20** |
 | refused correctly | **3 / 3** |
-| wrongly refused | 1 |
-| wrongly answered | 2 |
+| wrongly refused | 1–3 |
+| wrongly answered | 1–2 |
+
+**The ranges are not hedging.** Two questions in twenty flip between runs at
+temperature 0, with the same prompt and the same retrieved evidence: a question
+answered correctly in one run is declined in the next. So 16/20 and 17/20 are
+the same result, and any single run reported as a point estimate would invite
+more confidence than it earns.
+
+Per answered question, measured on the Anthropic backend:
+
+| | |
+|---|---|
+| latency, end to end | ~2.9 s |
+| tokens | ~3,700 in, ~85 out |
+| cost | ~$0.012 |
+
+Cost is almost entirely the evidence sent, not the answer generated — 3,700
+input tokens against 85 output. So a cheaper configuration means retrieving
+less, not generating less, and `--top-k` is the knob that moves the bill.
 
 Retrieval measured separately, over the 18 questions with a single source page:
 
@@ -246,10 +263,14 @@ they cannot distinguish from a correct one without doing the research
 themselves. Collapsing both into an accuracy figure would hide the difference
 this project exists to maintain.
 
-### The three failures
+### The failures
 
 **q019 — a retrieval miss.** The answer is on page 7 of Reed's rebuttal and
 retrieval returns pages 5, 14 and 20. Prose again.
+
+**q007 and q018 — the variance.** Both were answered correctly in earlier runs
+with the same code. They are counted as failures in the run above and as
+successes in the one before it, which is what the ranges in the table describe.
 
 **q018 and q023 — verified, cited, and not answers.** Asked what Mr. Garrett's
 adjustment *consisted of*, the system explained his rationale instead: every
