@@ -69,14 +69,7 @@ SPAN_SIMILARITY_FLOOR = 0.85
 CONTESTED_PREDICATES = {
     "requested": {"request", "requested", "sought", "proposed", "initially"},
     "recommended": {"recommend", "recommended", "recommendation", "proposal"},
-    # "agreed" and "approved" name the SAME figure in this docket: the
-    # signatories agreed to 9.4% and the Commission approved the agreement, in
-    # one document. Separating them refused the corpus's clearest question --
-    # a claim saying "the Final Order approved 9.4%" over a span saying "the
-    # signatories agreed" is correct, not a misattribution.
-    #
-    # What carries different numbers is requested (10.4%) against recommended
-    # (9.45%) against settled (9.4%). Those are the groups worth contesting.
+
     "settled": {
         "agreed", "agreement", "stipulated", "signatories", "settlement",
         "approved", "approves", "adopted", "ordered", "orders", "must",
@@ -250,10 +243,71 @@ def verify_claim(claim_text: str, quoted: str, chunk_text: str) -> Verification:
     )
 
 
+def verify_claim_over_units(
+    claim_text: str,
+    units: list[tuple[str, str]],
+) -> Verification:
+    """Verify a claim whose evidence spans several units, possibly several chunks.
+
+    THIS EXISTS BECAUSE THE OBVIOUS COMPOSITION IS WRONG
+
+    Joining the units into one string and calling verify_claim on it asks
+    whether text that was never adjacent appears adjacently. It does not, so the
+    span check fails on evidence that is genuinely in the record -- and the span
+    check is the one that cannot legitimately fail, since units are verbatim by
+    construction.
+
+    That mistake was made three times, always while rewriting the script that
+    composes these calls, and never caught: the checks below are unit tested in
+    isolation, and the bug lives in how they are combined. So the combination
+    lives here now, where the tests can reach it.
+
+    `units` is (unit text, the text of the chunk it came from). Each unit is
+    checked against its OWN chunk. Numbers and predicate look at the joined
+    evidence, because they ask whether a figure or a word appears anywhere in
+    what was cited, not whether it appears contiguously.
+    """
+    if not units:
+        return Verification(
+            span_verified=False,
+            numbers_verified=False,
+            predicate_supported=False,
+            failure_detail="the claim cites no evidence",
+        )
+
+    unverified = [
+        text for text, chunk in units if not verify_span(text, chunk)[0]
+    ]
+    joined = " ".join(text for text, _ in units)
+    context = "\n\n".join(dict.fromkeys(chunk for _, chunk in units))
+
+    numbers_ok, missing = verify_numbers(claim_text, joined)
+    predicate_ok, predicate_detail = verify_predicate(claim_text, joined, context)
+
+    detail = None
+    if unverified:
+        detail = (
+            f"{len(unverified)} cited unit(s) not found in the chunk they came from"
+        )
+    elif not numbers_ok:
+        detail = f"figures asserted but absent from the evidence: {', '.join(missing)}"
+    elif not predicate_ok:
+        detail = predicate_detail
+
+    return Verification(
+        span_verified=not unverified,
+        numbers_verified=numbers_ok,
+        predicate_supported=predicate_ok,
+        missing_numbers=missing,
+        failure_detail=detail,
+    )
+
+
 __all__ = [
     "Verification",
     "canonical_numbers",
     "verify_claim",
+    "verify_claim_over_units",
     "verify_numbers",
     "verify_predicate",
     "verify_span",

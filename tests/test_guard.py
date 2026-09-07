@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from puctqa.guard import (  # noqa: E402
     canonical_numbers,
     verify_claim,
+    verify_claim_over_units,
     verify_numbers,
     verify_predicate,
     verify_span,
@@ -204,3 +205,85 @@ def test_a_narrow_quotation_cannot_dodge_the_predicate_check():
         CHUNK,
     )
     assert not ok and "requested" in detail
+
+
+# --- Evidence spanning several units and chunks ---
+
+
+CHUNK_A = "PUC Docket No. 49421 Order Page 10 of 25\n" + APPROVED_SPAN
+CHUNK_B = (
+    "PUC Docket No. 49421 Order Page 21 of 25\n"
+    "The Commission approves the rates, terms, and conditions of the agreement "
+    "to the extent provided in this Order."
+)
+UNIT_A = "a return on equity of 9.4%, and a capital structure of 57.5% long-term debt"
+UNIT_B = "The Commission approves the rates, terms, and conditions of the agreement"
+
+
+def test_a_claim_may_cite_units_from_two_chunks():
+    """The regression this function exists for.
+
+    Joining the units and checking the join as one passage asks whether text
+    that was never adjacent appears adjacently. It does not, so the span check
+    fails on evidence that is genuinely in the record -- and the span check
+    cannot legitimately fail, since units are verbatim by construction.
+
+    Made three times while rewriting the composing script, never caught,
+    because the checks are unit tested in isolation and the bug is in how they
+    combine.
+    """
+    joined = UNIT_A + " " + UNIT_B
+    assert not verify_span(joined, CHUNK_A)[0]  # the wrong way round
+    assert not verify_span(joined, CHUNK_B)[0]
+
+    result = verify_claim_over_units(
+        "The Final Order approved a return on equity of 9.4%.",
+        [(UNIT_A, CHUNK_A), (UNIT_B, CHUNK_B)],
+    )
+    assert result.span_verified
+    assert result.verified
+
+
+def test_a_unit_from_the_wrong_chunk_still_fails():
+    """Per-unit checking must not become a rubber stamp."""
+    result = verify_claim_over_units(
+        "The Final Order approved a return on equity of 9.4%.",
+        [(UNIT_A, CHUNK_B)],  # unit A is not in chunk B
+    )
+    assert not result.span_verified
+    assert "not found in the chunk" in result.failure_detail
+
+
+def test_figures_are_checked_across_all_cited_units():
+    """A figure may come from any cited unit, not only the first."""
+    result = verify_claim_over_units(
+        "The Commission approved a return on equity of 9.4%.",
+        [(UNIT_B, CHUNK_B), (UNIT_A, CHUNK_A)],
+    )
+    assert result.numbers_verified
+
+
+def test_a_figure_in_no_cited_unit_is_refused():
+    result = verify_claim_over_units(
+        "The Final Order approved a return on equity of 9.45%.",
+        [(UNIT_A, CHUNK_A), (UNIT_B, CHUNK_B)],
+    )
+    assert result.span_verified
+    assert not result.numbers_verified
+
+
+def test_the_predicate_check_sees_every_cited_chunk():
+    """Context is the union of the chunks cited, so a predicate stated in one
+    chunk supports a claim resting partly on another."""
+    result = verify_claim_over_units(
+        "CenterPoint Houston requested a return on equity of 9.4%.",
+        [(UNIT_A, CHUNK_A)],
+    )
+    assert result.span_verified and result.numbers_verified
+    assert not result.predicate_supported
+
+
+def test_a_claim_citing_nothing_is_refused():
+    result = verify_claim_over_units("The approved ROE was 9.4%.", [])
+    assert not result.verified
+    assert "no evidence" in result.failure_detail

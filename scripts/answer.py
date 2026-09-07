@@ -50,12 +50,7 @@ import psycopg  # noqa: E402
 
 from puctqa.evidence import EvidenceUnit, segment_chunk  # noqa: E402
 from puctqa.generate import BACKENDS, ProposedClaim, Usage, propose  # noqa: E402
-from puctqa.guard import (  # noqa: E402
-    Verification,
-    verify_numbers,
-    verify_predicate,
-    verify_span,
-)
+from puctqa.guard import verify_claim_over_units  # noqa: E402
 from puctqa.retrieve import Hit, search  # noqa: E402
 
 DEFAULT_DSN = "postgresql://puctqa:puctqa@localhost:5432/puctqa"
@@ -163,39 +158,24 @@ def answer(cur, question: str, backend, embed, top_k: int = DEFAULT_TOP_K) -> An
         return result
 
     for claim in proposal.claims:
-        chunk_ids = {u.chunk_id for u in claim.units}
-        sources = [by_chunk[cid] for cid in chunk_ids if cid in by_chunk]
-        if not sources:
-            continue
-
-        spans_ok = all(
-            verify_span(u.text, by_chunk[u.chunk_id].text)[0]
+        sources = {
+            u.chunk_id: by_chunk[u.chunk_id]
             for u in claim.units
             if u.chunk_id in by_chunk
-        )
-
-        context_text = "\n\n".join(h.text for h in sources)
-        numbers_ok, missing = verify_numbers(claim.assertion, claim.quoted_span)
-        predicate_ok, predicate_detail = verify_predicate(
-            claim.assertion, claim.quoted_span, context_text
-        )
-
-        detail = None
-        if not spans_ok:
-            detail = "a cited unit is not in the chunk it came from"
-        elif not numbers_ok:
-            detail = f"figures absent from the evidence: {', '.join(missing)}"
-        elif not predicate_ok:
-            detail = predicate_detail
-
-        verification = Verification(
-            span_verified=spans_ok,
-            numbers_verified=numbers_ok,
-            predicate_supported=predicate_ok,
-            missing_numbers=missing,
-            failure_detail=detail,
-        )
-        record = VerifiedClaim(claim, verification, sources[0])
+        }
+        if not sources:
+            continue
+        # Each unit paired with the chunk it came from. The composition lives in
+        # guard.verify_claim_over_units, not here: joining the units and
+        # checking the join was written wrong three times in this file, and the
+        # guard's tests could not reach it while it lived in a script.
+        evidence = [
+            (u.text, by_chunk[u.chunk_id].text)
+            for u in claim.units
+            if u.chunk_id in by_chunk
+        ]
+        verification = verify_claim_over_units(claim.assertion, evidence)
+        record = VerifiedClaim(claim, verification, next(iter(sources.values())))
         (result.verified if verification.verified else result.rejected).append(record)
 
     if not result.verified:
