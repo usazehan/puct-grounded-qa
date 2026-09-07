@@ -8,3 +8,5 @@ data/raw/*
 data/native/*
 !data/native/.gitkeep
 data/eval_cache/
+tmp/
+.DS_Store
