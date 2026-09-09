@@ -1,33 +1,16 @@
 #!/usr/bin/env python3
 """Measure retrieval against the eval question set.
 
-This measures RETRIEVAL ONLY: does the chunk containing the answer come back in
-the top k? No answer is generated and none is checked. Retrieval failure and
-generation failure need separating, and the cheaper one to fix comes first --
-a system that never retrieves the right chunk cannot be rescued by a better
-prompt.
+Retrieval only: did a chunk from the source page come back in the top k? No
+answer is generated. Retrieval failure and generation failure need separating,
+and a system that never finds the right chunk cannot be rescued by a prompt.
 
-WHAT COUNTS AS A HIT
-
-A question names its source document and page. A hit is a returned chunk from
-that document whose page span contains that page. That is deliberately coarse:
-a chunk is up to 2,000 characters and a page usually yields two or three, so
-this measures "did retrieval reach the right page" rather than "did it reach
-the right sentence". Tightening it would need per-question span labels, which
-is work worth doing only once page-level recall is good.
-
-REFUSAL QUESTIONS ARE EXCLUDED FROM RECALL
-
-Five of fifteen questions have no correct source: the answer is a refusal,
-because the corpus holds two irreconcilable values or none at all. There is no
-chunk to retrieve, so scoring them here would measure nothing. They belong to
-the guard, not to retrieval, and are counted separately so the number is not
-quietly dropped.
+Refusal questions are excluded -- they have no source chunk by construction --
+and so are qualified-set questions, which have several valid sources and no
+single page for recall to reach.
 
 Usage:
-    python scripts/eval_retrieval.py
-    python scripts/eval_retrieval.py --k 5
-    python scripts/eval_retrieval.py --config lexical
+    python scripts/eval_retrieval.py --k 3 --show-misses
 """
 
 from __future__ import annotations
@@ -41,15 +24,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-import psycopg  # noqa: E402
+import psycopg  
 
-from puctqa.retrieve import search  # noqa: E402
+from puctqa.retrieve import search  
 
 DEFAULT_DSN = "postgresql://puctqa:puctqa@localhost:5432/puctqa"
 DEFAULT_MODEL = "Qwen/Qwen3-Embedding-0.6B"
 
-# The ablation. Each row is a retrieval configuration, and the comparison worth
-# making is hybrid against either arm alone -- not which embedding model wins.
+# Each row is a retrieval configuration, and the comparison worth making is hybrid against either arm alone
 CONFIGS = {
     "lexical": dict(use_dense=False, use_lexical=True, use_trigram=False),
     "dense": dict(use_dense=True, use_lexical=False, use_trigram=False),
@@ -67,7 +49,7 @@ def page_of(hit, cur) -> tuple[str, int, int]:
 
 
 def is_hit(question: dict, hits: list) -> bool:
-    """Did any returned chunk come from the question's source page?"""
+    # Did any returned chunk come from the question's source page?
     want_doc = question["source_document"]
     want_page = question["source_page"]
     return any(h.document == want_doc and h.page_start == want_page for h in hits)
@@ -138,9 +120,7 @@ def main() -> int:
                     misses.append((q["id"], q["question"]))
 
             hits_total = sum(sum(v) for v in by_category.values())
-            # Mean reciprocal rank over questions that were found at all. Recall
-            # says whether the page is reachable; MRR says how far a reader
-            # would have to scroll.
+            # Mean reciprocal rank over questions that were found at all. Recall says whether the page is reachable; MRR says how far a reader would have to scroll
             mrr = sum(1 / r for r in ranks) / len(answerable) if answerable else 0.0
             results[name] = {
                 "recall": hits_total / len(answerable),

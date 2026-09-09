@@ -1,40 +1,20 @@
 """Propose claims from retrieved evidence.
 
-The model's job is deliberately small: read a question and a numbered list of
-evidence units, and either select the ids that support an answer or say the
-passages do not support one. It never writes a span, a citation, or a final
-answer.
+The model reads a question and a numbered list of evidence units, and either
+selects the ids supporting an answer or says the passages do not support one.
+It never writes a span, a citation, or a final answer.
 
-WHY IDS AND NOT QUOTATIONS
+Ids rather than quotations: asking a model to quote its source makes verbatim
+copying a capability requirement, and a model that paraphrases fails span
+verification even when its claim is right. Selecting from a closed list makes
+exact quotation an invariant, since code resolves each id to text and offsets
+recorded during segmentation.
 
-Asking a model to quote its source makes verbatim copying a capability
-requirement -- a model that paraphrases fails span verification even when its
-claim is correct, and the guard's fuzzy span check ends up compensating for
-model behaviour rather than for OCR damage. Selecting from a closed list of ids
-makes exact quotation an invariant: code resolves each id to the text and the
-document offsets recorded during segmentation, so a claim cannot cite a passage
-that was never given to it, and cannot cite it inaccurately.
+That retires one failure mode and leaves two -- a claim can assert a figure its
+evidence lacks, or select correct evidence and say the wrong thing about it.
 
-That does not make the guard redundant. It retires one failure mode and leaves
-two: a claim can assert a figure the selected evidence does not contain, and a
-claim can select correct evidence and say the wrong thing about it -- which is
-exactly what retrieval already produces for "what return on equity did
-CenterPoint request?", where the top chunk states the agreed 9.4% rather than
-the requested 10.4%.
-
-BACKENDS
-
-Three, behind one callable, because they answer different questions.
-
-    anthropic  needs a key, runs anywhere, fast. The demo default.
-    ollama     needs Ollama and a pulled model, no key, runs locally.
-    echo       needs nothing. Deterministic, not intelligent -- it exercises
-               the whole path so the test suite covers it and a reviewer who
-               has cloned the repository can watch it run.
-
-The point of the seam is that backends are comparable. How small a model can
-abstain when the passages do not support an answer is a measurement, not a
-guess, and the eval can make it the same way it compared retrieval arms.
+Three backends: anthropic (a key), ollama (local), echo (neither; not
+intelligent, but it makes the pipeline testable).
 """
 
 from __future__ import annotations
@@ -50,9 +30,6 @@ from typing import Callable, Protocol
 
 from .evidence import EvidenceUnit
 
-# The model returns exactly this, and nothing else. status is an enum of two
-# values and evidence_ids is constrained to the ids supplied with the request,
-# so a well-formed response cannot cite something absent.
 RESPONSE_SCHEMA = {
     "type": "object",
     "properties": {
@@ -140,12 +117,8 @@ class Usage:
 
     @property
     def cost_usd(self) -> float | None:
-        """None when the price is unknown, never zero.
-
-        A local model has no per-token price and an unrecognised model has no
-        price this file knows. Reporting either as $0.00 would put a number in a
-        results table that means "not measured".
-        """
+        # None when the price is unknown, never zero
+        
         rates = PRICES_PER_MTOK.get(self.model or "")
         if rates is None:
             return None
@@ -176,9 +149,7 @@ class Proposal:
     claims: list[ProposedClaim] = field(default_factory=list)
     raw: str = ""
     usage: Usage = field(default_factory=Usage)
-    # Ids the model returned that were not in the supplied list. A well-formed
-    # response has none; recorded rather than discarded, because a backend that
-    # invents ids is a backend to stop using.
+
     invalid_ids: list[str] = field(default_factory=list)
 
     @property
@@ -204,13 +175,9 @@ def build_prompt(
     units: list[EvidenceUnit],
     context: dict[int, str] | None = None,
 ) -> str:
-    """Assemble the request.
-
-    `context` maps a chunk id to its page header. Headers are shown but never
-    listed as valid ids: a table row is six bare values, and only the header
-    says which is the charge and which is the lumen rating -- but a claim
-    citing a column heading asserts nothing, so it must not be citable.
-    """
+    # Assemble the request
+    # `context` maps a chunk id to its page header
+    
     parts = [INSTRUCTIONS, f"Question: {question}", ""]
     if context:
         parts.append(
@@ -228,12 +195,8 @@ def build_prompt(
 
 
 def _extract_json(text: str) -> dict:
-    """Parse the response, tolerating a fenced block or surrounding prose.
-
-    A backend that wraps JSON in explanation is not malformed enough to discard
-    -- but anything that is not parseable at all is treated as a refusal by the
-    caller rather than guessed at.
-    """
+    # Parse the response, tolerating a fenced block or surrounding prose
+    
     text = text.strip()
     fenced = re.search(r"```(?:json)?\s*(.+?)```", text, re.DOTALL)
     if fenced:
@@ -245,14 +208,8 @@ def _extract_json(text: str) -> dict:
 
 
 def parse_proposal(raw: str, units: list[EvidenceUnit]) -> Proposal:
-    """Turn a response into claims with resolved evidence.
-
-    Ids are resolved against the supplied units, so the text and offsets a claim
-    carries come from segmentation rather than from the model. An id that was
-    not supplied is dropped and recorded; a claim left with no valid evidence is
-    dropped entirely, because a claim with nothing behind it is exactly what the
-    guard exists to refuse.
-    """
+    # Turn a response into claims with resolved evidence.
+    
     by_id = {u.unit_id: u for u in units}
     try:
         payload = _extract_json(raw)
@@ -293,21 +250,17 @@ def propose(
     prompt = build_prompt(question, units, context)
     try:
         raw = backend(prompt, [u.unit_id for u in units])
-    except Exception as exc:  # noqa: BLE001
-        # A backend failure is not a refusal by the system, but it must not read
-        # as support either. Recorded so a run with a broken backend is
-        # distinguishable from a run where the corpus was silent.
+    except Exception as exc:  
         return Proposal(status="no_support", raw=f"backend error: {exc}")
     proposal = parse_proposal(raw, units)
     proposal.usage = getattr(backend, "last_usage", Usage())
     return proposal
 
 
-# --- Backends ---
 
 
 def _timed(fn):
-    """Record latency around a backend call."""
+    # Record latency around a backend call
 
     def wrapper(prompt: str, unit_ids: list[str]) -> str:
         start = time.perf_counter()
@@ -326,11 +279,8 @@ def _timed(fn):
 
 def _echo(prompt: str, unit_ids: list[str]) -> str:
     """Deterministic stand-in. Not intelligent; it exercises the path.
-
     Selects the first unit whose text shares a distinctive token with the
-    question, and refuses otherwise. That is enough to prove the pipeline runs
-    end to end with no key, no download, and no network -- which is what lets
-    the test suite cover the generator at all.
+    question, and refuses otherwise. 
     """
     question = prompt.split("Question:", 1)[-1].split("\n", 1)[0].lower()
     words = {w.strip("?,.'\"") for w in question.split() if len(w) > 4}
@@ -358,13 +308,7 @@ echo_backend = _timed(_echo)
 def ollama_backend(
     model: str = "qwen3.5:9b", host: str = "http://localhost:11434"
 ) -> Backend:
-    """Local generation through Ollama. No key; needs `ollama pull <model>`.
-
-    Uses Ollama's structured-output support so the response conforms to the
-    schema. That guarantees valid JSON and the two status values -- it does not
-    guarantee the ids are real, which is why parse_proposal resolves them
-    against the supplied units rather than trusting them.
-    """
+    # Local generation through Ollama. No key; needs `ollama pull <model>`.
 
     def call(prompt: str, unit_ids: list[str]) -> str:
         schema = json.loads(json.dumps(RESPONSE_SCHEMA))
@@ -406,11 +350,8 @@ def ollama_backend(
 def anthropic_backend(
     model: str = "claude-sonnet-4-6", api_key: str | None = None
 ) -> Backend:
-    """Hosted generation. Needs ANTHROPIC_API_KEY.
-
-    The default for a demo: one dependency, works on any machine, and the
-    volume here is a fraction of a cent per eval run.
-    """
+    # Hosted generation. Needs ANTHROPIC_API_KEY.
+    
     key = api_key or os.environ.get("ANTHROPIC_API_KEY")
     if not key:
         raise SystemExit(

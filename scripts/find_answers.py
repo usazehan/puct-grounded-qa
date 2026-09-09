@@ -1,18 +1,13 @@
 #!/usr/bin/env python3
 """Find candidate answers in the retrievable corpus.
 
-Writing an eval question means knowing its answer and where the answer lives.
-This searches the served text of retrieval-eligible sets and prints each hit
-with its page, citation anchor, and surrounding lines -- enough to write the
-question, the expected answer, and the source reference in one pass.
-
-A term with no hits is as informative as one with many: the question either
-gets dropped or becomes a refusal case, because the corpus cannot support it.
+A drafting aid for the eval set: search the served text and print each hit with
+its page and citation anchor, so a question, its answer and its source come
+from one pass. A term with no hits is equally useful -- the question either
+gets dropped or becomes a refusal case.
 
 Usage:
-    python scripts/find_answers.py "return on equity" "revenue requirement"
-    python scripts/find_answers.py --context 6 PBRAF
-    python scripts/find_answers.py --docs 49421_795_1057873.pdf "metal halide"
+    python scripts/find_answers.py "return on equity" PBRAF
 """
 
 from __future__ import annotations
@@ -26,9 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from puctqa.extract import extract_document  # noqa: E402
 
-# The six retrieval-eligible sets, as marked operative in the manifest. Hard
-# coded rather than read from the database so this runs without Postgres --
-# it is a drafting aid, not part of the pipeline.
+# The six retrieval-eligible sets, as marked operative in the manifest. Hard coded rather than read from the database so this runs without Postgres 
 RETRIEVABLE = [
     "49421_416_1021257.pdf",   # Pollock direct (TIEC)
     "49421_593_1022852.pdf",   # Reed rebuttal, part 1
@@ -55,8 +48,7 @@ def search(root: Path, names: list[str], term: str, context: int, limit: int) ->
         doc = extract_document(path.read_bytes())
         lines = doc.text.splitlines()
 
-        # Offset of each line, so a hit can be mapped back to its page and
-        # therefore to the anchor a citation would use.
+        # Offset of each line, so a hit can be mapped back to its page and therefore to the anchor a citation would use
         offsets, cursor = [], 0
         for line in lines:
             offsets.append(cursor)

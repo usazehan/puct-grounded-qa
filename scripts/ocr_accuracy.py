@@ -40,10 +40,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-# A corpus of agency filings contains malformed files, and their parser noise
-# buries the report. Silenced by default and restored by --show-parse-errors,
-# because a document that will not parse is a finding, not a nuisance: it ends
-# up unmeasured, and unmeasured must not read as clean.
+# Parser noise from malformed filings buries the report. --show-parse-errors
+# restores it; a file that will not parse still lands as no_ground_truth.
 warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
 
 from puctqa.extract import extract_document  # noqa: E402
@@ -64,38 +62,31 @@ NUM_RE = re.compile(
     re.VERBOSE,
 )
 
-# Pleading line numbers -- the 1-25 running down a testimony margin -- extract as
-# standalone lines. In item 786 they are 277 of 386 numeric tokens and sit
-# between every pair of content lines, so they inflate line distance and make
-# small integers findable anywhere. Page furniture, not content.
+# Pleading line numbers, the 1-25 down a testimony margin. 277 of item 786's 386
+# numeric tokens, and they make small integers findable anywhere.
 PLEADING_LINE_RE = re.compile(r"\s*\d{1,2}\s*")
 
-# Tariff prose numbers its subsections "(1) The Competitive Retailer...", and a
-# parenthesized digit there is a list marker, not the accounting convention for a
-# negative. Only line-initial bare integers are treated as markers: a genuine
-# (1,234) adjustment sits inside a table row, never at the head of a line.
+# Tariff prose numbers subsections "(1) The Competitive Retailer...", so a
+# parenthesized digit there is a list marker, not a negative. Line-initial only:
+# a real (1,234) sits inside a row, never at the head of a line.
 ENUMERATION_RE = re.compile(r"^[ \t]*\(\d{1,2}\)(?=\s|$)", re.MULTILINE)
 
-# Table-of-contents lines carry section numbers and page numbers that are
-# navigation, not content. Dot leaders identify them unambiguously.
+# Dot leaders identify contents lines: navigation, not content.
 TOC_LEADER_RE = re.compile(r"^.*\.{5,}.*$", re.MULTILINE)
 
-# Below this numeric fidelity, extraction has failed systemically and the
-# document should not support numeric claims at all. Above it, the misses are
-# individual values, and the guard already refuses those one at a time when it
-# cannot match them to a span -- excluding a 371-page tariff because six of its
-# eight thousand numbers did not round-trip throws the document away to avoid
-# six errors. Item 795 sits at 99.4%; a genuinely corrupted scan sits far below.
+# Below this, extraction failed systemically. Above it the misses are individual
+# values and the guard refuses those per claim -- excluding a 371-page tariff
+# over six of its eight thousand figures throws the document away to avoid six
+# errors. Item 795 sits at 99.4%.
 SYSTEMIC_NUMERIC_FLOOR = 99.0
 
-# Association is different: a broken row binds a correct value to the wrong
-# label, and the guard CANNOT catch it -- it verifies against the chunk, and the
-# chunk is the defective artifact. So the bar stays high.
+# Higher, because a broken row binds a correct value to the wrong label and the
+# guard cannot catch it: it verifies against the chunk, and the chunk is what is
+# wrong.
 SYSTEMIC_ASSOCIATION_FLOOR = 99.5
 
-# A bundle spreadsheet earns its way into the association check by covering the
-# served document. Below this ratio of locatable pairs to served numeric tokens
-# it is a workpaper behind the filing rather than the filing's own tables.
+# Below this share of the served document's values, a bundle spreadsheet is a
+# workpaper behind the filing rather than the filing's own tables.
 WORKPAPER_YIELD_FLOOR = 0.25
 
 # A value this common in a document cannot be tied to one row by proximity.
@@ -263,35 +254,24 @@ def read_native(path: Path) -> NativeDoc:
 
 NATIVE_SUFFIXES = {".docx", ".pdf", ".xlsx", ".xlsm"}
 
-# A native ZIP holds several files, and which one is "the document" cannot be
-# decided by format. Item 773 ships both a memo .docx and a memo-and-attachments
-# .pdf; the served filing is the latter, so ranking .docx first would compare a
-# cover memo against a document eight attachments long. That scores near 100%,
-# because every word of the memo really is in the PDF -- it just measures a
-# fifth of the filing and reports the fraction as the whole.
-#
-# So the primary is chosen by how much of the served document it accounts for,
-# and format rank survives only as a tie-break. Spreadsheets are never primary:
-# a cell dump is not prose, whatever it covers.
+# Which file in a bundle is "the document" cannot be decided by format. Item 773
+# ships a memo .docx and a memo-and-attachments .pdf; ranking .docx first
+# compares a cover memo against a filing eight attachments long and scores near
+# 100% on a fifth of it. Format rank is a tie-break only, and a spreadsheet is
+# never primary.
 FORMAT_PREFERENCE = {".docx": 0, ".pdf": 1, ".xlsx": 2, ".xlsm": 3}
 TEXT_SUFFIXES = {".docx", ".pdf"}
 
-# A comparison needs something to compare against. Item 773's native bundle
-# contains a PDF of the same scan, with no text layer -- it extracted to nothing,
-# so 0 of 0 numeric tokens matched and the verdict read 100%. Absence of ground
-# truth must never present as perfect agreement, so a native this thin is
-# reported as no_ground_truth rather than scored.
+# Item 773's native bundle holds a PDF of the same scan with no text layer. It
+# extracted to nothing, 0 of 0 tokens matched, and the verdict read 100% for two
+# weeks. Absence of ground truth must not present as perfect agreement.
 MIN_GROUND_TRUTH_WORDS = 50
 MIN_GROUND_TRUTH_NUMERICS = 20
 
-# Absolute counts are not enough. Item 773's best native is a two-page memo:
-# 191 words and 24 numeric tokens, clearing the floor above while covering 23.6%
-# of a 26-page filing. It scores 100% because every figure it contains really is
-# in the served text -- and the twenty-odd pages of schedules it says nothing
-# about are never examined. So the native must also account for a fair share of
-# the SERVED document. This is the mirror of the partial_pairing check: there the
-# served file was a fragment of the native, here the native is a fragment of the
-# served file.
+# Counts alone are not enough: item 773's best native is a two-page memo with
+# 191 words that clears the floors above while covering 23.6% of a 26-page
+# filing, and scores 100% on the fraction it does cover. The mirror of
+# partial_pairing -- there the served file is a fragment, here the native is.
 MIN_NATIVE_COVERAGE = 60.0
 
 # Below this word accuracy, a mispairing is likelier than bad OCR. Measured
@@ -302,10 +282,9 @@ MISPAIR_FLOOR = 50.0
 # means the pairing is right and incomplete rather than wrong. See verdict().
 CONTAINMENT_FLOOR = 90.0
 
-# Document IDs within one set run consecutively (795 set A is 1057872-1057875);
-# a refiled set lands in a much later batch (1119824-1119827). A gap this large
-# starts a new set. Page-range descriptions are NOT used to group -- 795 serves
-# two documents both described "Pages 101 to 200".
+# Document IDs run consecutively within a set (795-A is 1057872-1057875) and a
+# refiling lands in a later batch (1119824-1119827). Page-range descriptions are
+# not used to group: 795 serves two documents both described "Pages 101 to 200".
 SET_ID_GAP = 32
 
 
@@ -785,7 +764,6 @@ VERDICT_NOTE = {
 }
 
 
-# --- Report ---
 
 
 def main() -> int:

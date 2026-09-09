@@ -1,30 +1,11 @@
 """Split chunks into addressable evidence units.
 
-A claim must rest on an exact span of the source. The obvious way to get one is
-to ask a model to quote the passage, but a model that paraphrases fails span
-verification even when its claim is correct -- so verbatim quotation becomes a
-capability requirement, and the guard's fuzzy span check ends up compensating
-for model behaviour rather than for OCR damage.
+A model selects unit ids from a closed list; code resolves them to text and
+document offsets. Quotation is verbatim by construction rather than by model
+behaviour, and a model cannot cite a passage it was never given.
 
-Segmenting first removes the problem. Each unit gets an id, its text, and its
-character offsets in the document. A model selects ids from a closed list; code
-resolves them to text and offsets. Quotation is verbatim by construction, and
-the model cannot cite a passage that was never given to it.
-
-That shifts what the guard is for. verify_span stops being load-bearing -- the
-span is exact by construction -- while the other two checks matter more:
-verify_numbers catches a claim asserting a figure the selected evidence does not
-contain, and verify_predicate catches a claim that selects a correct span and
-says the wrong thing about it, which is the failure retrieval already produces
-on its own.
-
-UNIT BOUNDARIES FOLLOW PAGE LAYOUT, AS CHUNKING DOES
-
-Prose splits on sentences. Tables split on rows, using the same reading-order
-rule as chunking: a label owns the numeric lines that follow it. A rate schedule
-row is one fact -- "Metal Halide (175w) / $9.24 / 12,900 / 210 / N/A / 70" --
-and splitting it further would hand a model a bare figure with no label, which
-is the misattribution the row-boundary rule exists to prevent.
+Prose splits on sentences, tables on rows -- a rate schedule row is one fact,
+and splitting it hands a model a bare figure with no label.
 """
 
 from __future__ import annotations
@@ -34,19 +15,14 @@ from dataclasses import dataclass
 
 from .chunk import Line, PageKind, content_lines, split_lines
 
-# Sentence boundary: terminator, closing quote or bracket, then whitespace and a
-# capital or a digit. Abbreviations common in these filings are excluded below
-# rather than by a general abbreviation list, because the failure mode here is
-# splitting a citation in half.
+# Terminator, closing quote or bracket, whitespace, then a capital or digit.
 SENTENCE_END_RE = re.compile(r"(?<=[.!?])[\"')\]]*\s+(?=[A-Z0-9])")
 
-# Splitting after these would cut a reference in two. "No." and "Sec." are
-# everywhere in a docket; "U.S.C." and "Tex." appear in every legal citation.
-# A single capital letter followed by a period is an initial or a rule
-# reference -- "P.U.C. Subst. R. 25.243" splits at "R." otherwise, because the
-# next token starts with a digit.
+# A single capital plus period is an initial or a rule reference. "P.U.C. Subst.
+# R. 25.243" splits at "R." otherwise, because the next token starts with a digit.
 INITIAL_RE = re.compile(r"(?:^|\s)[A-Z]\.$")
 
+# Splitting after these cuts a citation in half.
 ABBREVIATIONS = (
     "No.", "Nos.", "Sec.", "Secs.", "Art.", "Ch.", "Chs.", "Ex.", "Exh.",
     "Tex.", "U.S.", "U.S.C.", "P.U.C.", "Subst.", "Rule.", "Inc.", "LLC.",
@@ -54,13 +30,12 @@ ABBREVIATIONS = (
     "approx.", "est.", "et al.", "v.", "vs.", "cf.",
 )
 
-# Below this a "sentence" is a fragment -- a heading, a stray label, an
-# extraction artifact -- and a claim resting on it would cite almost nothing.
+# Below this a "sentence" is a fragment -- a heading or an extraction artifact --
+# and a claim resting on it cites almost nothing.
 MIN_UNIT_CHARS = 25
 
-# A unit longer than this is a paragraph the sentence splitter could not break,
-# usually because extraction lost the terminators. Cited, it would be a wall of
-# text standing in for a specific statement.
+# Above this the splitter failed to break a paragraph, usually because
+# extraction lost the terminators.
 MAX_UNIT_CHARS = 600
 
 
@@ -98,29 +73,21 @@ def _ends_with_abbreviation(text: str) -> bool:
     return any(stripped.endswith(abbrev) for abbrev in ABBREVIATIONS)
 
 
-# Placeholder cells. A rate schedule marks an inapplicable column "N/A", and
-# because that is not a numeral it reads as a new row label -- splitting
-# "Metal Halide (175w) / $9.24 / 12,900 / 210 / N/A / 70" into three pieces, one
-# of which is the bare word N/A and another the orphaned 70.
-#
-# The same flaw is in chunk.group_rows, which means table CHUNKS are being cut
-# at N/A too. Fixed here because evidence units are what a claim cites; the
-# chunking case is cosmetic by comparison, but it is the same bug.
+# "N/A" is not a numeral, so it reads as a new row label and splits
+# "Metal Halide (175w) / $9.24 / 12,900 / 210 / N/A / 70" into three pieces.
+# chunk.group_rows has the same flaw and is not fixed -- cosmetic there,
+# citable here.
 PLACEHOLDER_CELLS = frozenset({"n/a", "n.a.", "na", "--", "-", "—", "n/a.", "tbd"})
 
 
 def _is_cell(line: Line) -> bool:
-    """A continuation of the current row rather than the start of a new one."""
+    # A continuation of the current row rather than the start of a new one
     return line.is_numeric or line.text.strip().lower() in PLACEHOLDER_CELLS
 
 
 def split_sentences(text: str) -> list[tuple[int, int]]:
-    """(start, end) offsets of sentences within `text`.
+    # start, end) offsets of sentences within `text`.
 
-    Offsets rather than strings, so a caller can map them back onto document
-    positions. A split that would cut after an abbreviation is rejoined --
-    "PUC Docket No. 49421" is one reference, not two sentences.
-    """
     spans: list[tuple[int, int]] = []
     start = 0
     for match in SENTENCE_END_RE.finditer(text):
@@ -135,11 +102,8 @@ def split_sentences(text: str) -> list[tuple[int, int]]:
 
 
 def _merge_short(units: list[tuple[int, int]], text: str) -> list[tuple[int, int]]:
-    """Fold fragments into the neighbour they belong to.
+    # Fold fragments into the neighbour they belong to.
 
-    Extraction leaves headings and stray labels on their own. Cited alone they
-    carry no statement, and dropping them would lose text a longer unit needs.
-    """
     merged: list[tuple[int, int]] = []
     for start, end in units:
         if merged and len(text[start:end].strip()) < MIN_UNIT_CHARS:
@@ -207,15 +171,8 @@ def units_from_prose(
 def units_from_table(
     chunk_id: int, lines: list[Line], ordinal_start: int = 0
 ) -> list[EvidenceUnit]:
-    """One unit per table row.
+    # One unit per table row.
 
-    A row is one fact. Splitting further hands a model a bare figure with no
-    label -- the misattribution the row-boundary rule exists to prevent -- and
-    merging rows would let a claim cite a schedule rather than a rate.
-    """
-    # drop_pleading=False: on a table page a bare one- or two-digit line is a
-    # cell value, not margin numbering. The monthly kWh column of item 795-A's
-    # street lighting schedule reads 70, 98, 159, 367.
     rows: list[list[Line]] = []
     for line in content_lines(lines, drop_pleading=False):
         if _is_cell(line) and rows:
@@ -250,13 +207,7 @@ def segment_chunk(
     char_end: int,
     kind: str,
 ) -> list[EvidenceUnit]:
-    """Split one chunk's body into evidence units.
-
-    Only the body. A chunk's header is context prepended to every unit on the
-    page, not a statement any claim should rest on: "(amounts in thousands)"
-    tells a reader how to read a figure, and a claim citing it alone asserts
-    nothing.
-    """
+    # Split one chunk's body into evidence units.
     lines = split_lines(document_text, char_start, char_end)
     if kind == PageKind.TABLE.value or kind == PageKind.TABLE:
         return units_from_table(chunk_id, lines)
@@ -264,12 +215,7 @@ def segment_chunk(
 
 
 def verify_units(units: list[EvidenceUnit], document_text: str) -> None:
-    """Assert every unit's offsets still hold its text.
-
-    Raises rather than returns, for the same reason verify_chunk_spans does: a
-    unit with drifting offsets produces a citation that resolves to the wrong
-    passage, which is worse than one that fails outright.
-    """
+    # Assert every unit's offsets still hold its text.
     for unit in units:
         if not unit.resolves_in(document_text):
             raise AssertionError(

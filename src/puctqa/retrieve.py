@@ -1,28 +1,18 @@
 """Retrieval over the eligible corpus: dense, lexical, and their fusion.
 
-Two regimes, complementary failure modes.
+Two regimes with complementary failure modes. A question about what Staff
+recommended shares almost no wording with the passage answering it; a question
+naming PBRAF or Sheet 6.7.2 needs a literal match, and dense embeddings smooth
+exactly the distinctions that matter -- PBRAF against PCRF, 9.4% against 9.45%.
 
-"What did Staff recommend on return on equity?" is where a dense embedding
-earns its place -- the answering passage says "the signatories agreed to a
-Return on Equity of 9.4%" and shares almost no wording with the question.
+Ranks are fused rather than scores: cosine distance and ts_rank are not on a
+common scale, and any weighting between them would be a constant nobody could
+defend.
 
-"What is the residential PBRAF?" is the opposite. PBRAF, LGS, Sheet 6.7.2 and
-40.4859% are high-information tokens that have to match literally, and dense
-embeddings smooth exactly the distinctions that matter: PBRAF against PCRF,
-9.4% against 9.45%. No general embedding model preserves an exact decimal.
-
-So both arms run on every query and their RANKS are fused, not their scores.
-Cosine distance and ts_rank are not on a common scale, and any weighting that
-mixed them would be a constant nobody could justify. Reciprocal rank fusion
-needs no calibration: a chunk that both arms rank highly wins, and a chunk only
-one arm finds still surfaces.
-
-EVERY QUERY IS FILTERED TO RETRIEVAL-ELIGIBLE SETS
-
-Not as an optimisation. A set is ineligible until a human decided which version
-of the record controls, and grounding an answer in a superseded tariff is the
-one failure neither span nor numeric verification can catch: the text would be
-quoted correctly from a document that no longer governs.
+Every query is filtered to retrieval-eligible sets. A set is ineligible until a
+human decided which version of the record controls, and grounding an answer in
+a superseded tariff is the one failure neither span nor numeric verification
+catches.
 """
 
 from __future__ import annotations
@@ -59,7 +49,7 @@ class Hit:
 
     @property
     def weakly_anchored(self) -> bool:
-        """True when the citation names a position in a file, not the record."""
+        # True when the citation names a position in a file, not the record
         return self.anchor_scheme == "pdf_page"
 
 
@@ -90,13 +80,8 @@ def _hit(row: tuple) -> Hit:
 
 
 def dense_search(cur, embedding: list[float], limit: int = DEFAULT_ARM_LIMIT) -> list[Hit]:
-    """Nearest neighbours by cosine distance.
+    # Nearest neighbours by cosine distance
 
-    Restricted to chunks embedded by the same model as the query. Two model
-    spaces in one column produce distances that are meaningless rather than
-    merely inaccurate -- the query still returns neighbours, they are simply
-    the wrong ones.
-    """
     cur.execute(
         f"""
         SELECT {SELECT_COLUMNS}
@@ -117,25 +102,15 @@ QUESTION_WORDS = frozenset("""
 
 
 def lexical_terms(query: str) -> str:
-    """Content words of a question, OR-ed.
+    # Content words of a question, ORed
 
-    OR rather than AND: a chunk holding "Return on Equity of 9.4%" should rank
-    for "what return on equity was approved" without also containing
-    'approved'. ts_rank orders by how many terms matched and how often, so the
-    chunk matching more of them still wins.
-    """
     words = [w.strip(".,?;:()'\"") for w in query.lower().split()]
     content = [w for w in words if w and w not in QUESTION_WORDS]
     return " | ".join(content) or query
 
 
 def lexical_search(cur, query: str, limit: int = DEFAULT_ARM_LIMIT) -> list[Hit]:
-    """Full-text search over the 'simple' configuration.
-
-    'simple' rather than 'english' for the index: stemming and stopword removal
-    mangle the tokens these documents turn on. LGS and PBRAF are not English
-    words, and a rate class named Standby should not collapse with standing.
-    """
+    # Full-text search over the 'simple' configuration
     terms = lexical_terms(query)
     cur.execute(
         f"""
@@ -151,14 +126,8 @@ def lexical_search(cur, query: str, limit: int = DEFAULT_ARM_LIMIT) -> list[Hit]
 
 
 def trigram_search(cur, term: str, limit: int = 10) -> list[Hit]:
-    """Fuzzy character-level match, for identifiers the exact index will miss.
+    # Fuzzy character-level match, for identifiers the exact index will miss
 
-    The corpus contains "PERIODIC BILLING RE UIREMENT" -- a dropped Q -- and
-    "ATIACHMENT D", in documents that otherwise measured 99.8% word accuracy.
-    An exact lexical match will sometimes miss a term that is visibly on the
-    page, and a docket or sheet number is exactly the kind of token a reader
-    would type verbatim.
-    """
     cur.execute(
         f"""
         SELECT {SELECT_COLUMNS}
@@ -175,13 +144,7 @@ def trigram_search(cur, term: str, limit: int = 10) -> list[Hit]:
 def reciprocal_rank_fusion(
     arms: dict[str, list[Hit]], k: int = RRF_K, limit: int = DEFAULT_LIMIT
 ) -> list[Hit]:
-    """Fuse ranked lists by rank, not by score.
-
-    Cosine distance, ts_rank, and trigram similarity are not comparable
-    quantities. Any weighted sum of them would need a constant nobody could
-    defend, and it would drift the moment a model or a text configuration
-    changed. Ranks are comparable by construction.
-    """
+    # Fuse ranked lists by rank, not by score
     merged: dict[int, Hit] = {}
     for arm, hits in arms.items():
         for rank, hit in enumerate(hits, start=1):
@@ -201,14 +164,8 @@ def search(
     use_lexical: bool = True,
     use_trigram: bool = False,
 ) -> list[Hit]:
-    """Run the enabled arms and fuse them.
+    # Run the enabled arms and fuse them
 
-    The arms are switchable so the eval can measure each configuration
-    separately. The interesting comparison is not which embedding model wins but
-    whether hybrid beats either arm alone -- on a corpus where half the queries
-    name a rate class and half describe a concept, the prediction is that it
-    does, and that is a claim worth measuring rather than assuming.
-    """
     arms: dict[str, list[Hit]] = {}
     if use_dense and embedding is not None:
         arms["dense"] = dense_search(cur, embedding, arm_limit)
@@ -218,8 +175,7 @@ def search(
         arms["trigram"] = trigram_search(cur, query, arm_limit // 3)
 
     if len(arms) == 1:
-        # A single arm needs no fusion, and fusing would only reorder by a
-        # constant.
+        # A single arm needs no fusion, and fusing would only reorder by a constant
         return next(iter(arms.values()))[:limit]
     return reciprocal_rank_fusion(arms, limit=limit)
 

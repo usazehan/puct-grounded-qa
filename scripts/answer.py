@@ -1,37 +1,15 @@
 #!/usr/bin/env python3
 """Answer a question, or refuse.
 
-The whole path in one place: retrieve chunks from retrieval-eligible sets,
-segment them into evidence units, ask a backend to select the units supporting
-a claim, verify each claim against the units it selected, and keep only what
-survives.
+Retrieve, segment into evidence units, have a backend select the units
+supporting a claim, verify each claim, keep what survives.
 
-REFUSAL IS THE DEFAULT OUTCOME, NOT AN ERROR PATH
-
-A question is answered when at least one claim passes all three checks. Every
-other outcome is a refusal, and each one is recorded with its reason:
-
-    the backend selected no evidence          the corpus is silent, or the
-                                              passages disagree with each other
-    a claim asserted a figure not in its      the model wrote a number the
-      evidence                                evidence does not contain
-    a claim's predicate did not match         the evidence says "agreed" and the
-      its evidence                            claim says "requested"
-
-The middle two are the model being caught. The first is the model declining,
-which is the behaviour the instructions ask for and the thing worth measuring.
-
-WHAT IS PERSISTED
-
-Every claim, verified or not, with the span it rested on and which check failed.
-A refusal with no record is indistinguishable from a question nobody asked, and
-the results table this project is building toward needs to say how often the
-system refused and why.
+A refusal is a normal outcome, not an error path, and is persisted with its
+reason: the results table needs to say how often the system refused and why.
 
 Usage:
     python scripts/answer.py "What return on equity was approved?"
-    python scripts/answer.py --backend anthropic "What is the T&D charge for a 175w metal halide?"
-    python scripts/answer.py --backend echo --show-evidence "..."
+    python scripts/answer.py --backend anthropic --show-evidence "..."
 """
 
 from __future__ import annotations
@@ -71,7 +49,7 @@ class VerifiedClaim:
 
     @property
     def weakly_anchored(self) -> bool:
-        """A citation naming a position in a file, not in the record."""
+        # A citation naming a position in a file, not in the record.
         return self.hit.anchor_scheme == "pdf_page"
 
 
@@ -85,8 +63,7 @@ class Answer:
     hits: list[Hit] = field(default_factory=list)
     usage: Usage = field(default_factory=Usage)
     review: Review = field(default_factory=Review)
-    # Wall clock for the whole path -- retrieval, segmentation, generation and
-    # verification -- not just the model call. What a reader waits for.
+    # Wall clock for the whole path (retrieval, segmentation, generation and verification)
     latency_ms: int = 0
     @property
     def refused(self) -> bool:
@@ -96,13 +73,9 @@ class Answer:
 def units_for(
     cur, hits: list[Hit]
 ) -> tuple[list[EvidenceUnit], dict[int, Hit], dict[int, str]]:
-    """Segment each retrieved chunk, keeping the hit each unit came from.
-
-    Segmentation runs against the document text rather than the chunk's stored
-    text, because a unit's offsets must be document offsets -- a citation that
-    resolves into a chunk rather than into the filing is not checkable by a
-    reader holding the PDF.
-    """
+    # Segment each retrieved chunk, keeping the hit each unit came from
+    # Segmentation runs against the document text rather than the chunk's stored text, because a unit's offsets must be document offsets 
+    
     units: list[EvidenceUnit] = []
     by_chunk: dict[int, Hit] = {}
     context: dict[int, str] = {}
@@ -124,9 +97,6 @@ def units_for(
         units.extend(segment_chunk(hit.chunk_id, document_text, char_start, char_end, kind))
         by_chunk[hit.chunk_id] = hit
         if ctx_start is not None:
-            # The page header: column labels a reader needs to tell which
-            # figure in a row is the charge and which is the lumen rating.
-            # Shown to the model, never citable.
             context[hit.chunk_id] = document_text[ctx_start:ctx_end]
     return units, by_chunk, context
 

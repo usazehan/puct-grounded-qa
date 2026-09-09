@@ -1,36 +1,19 @@
 """Verify a claim against the span it cites.
 
-Two checks, deliberately separate, because they fail for different reasons and
-a system that collapsed them would lose which one failed.
+Three checks, separate because they fail for different reasons and collapsing
+them would lose which one failed.
 
-SPAN VERIFICATION IS FUZZY
+Span verification is fuzzy: the corpus contains "PERIODIC BILLING RE UIREMENT"
+and "ATIACHMENT D" in a document measuring 99.8% word accuracy, and an exact
+match would refuse a quotation that is visibly on the page.
 
-The quoted span must actually appear in the cited chunk, but not byte for byte.
-The corpus contains "PERIODIC BILLING RE UIREMENT" -- a dropped Q -- and
-"ATIACHMENT D" in item 795-A, which measured 99.8% word accuracy overall. An
-exact match would refuse a quotation that is visibly on the page.
+Numeric verification is exact, and sign and unit are part of identity:
+(1,234) is not 1,234, and 10.4% is not 10.4.
 
-NUMERIC VERIFICATION IS EXACT
-
-Item 795-A round-trips 8,031 of 8,081 figures against a native covering 95.4%
-of its text. Digits survive extraction, so a figure that does not match is
-wrong rather than merely rendered differently. Sign and unit are part of
-identity: (1,234) is not 1,234, and 10.4% is not 10.4.
-
-WHAT NEITHER CHECK CATCHES
-
-Retrieval's rank-1 chunk for "what return on equity did CenterPoint request?"
-is the findings-of-fact page stating the *agreed* 9.4%. A claim quoting it
-passes span verification -- the text is really there -- and passes numeric
-verification -- 9.4 is really in it. It is still the wrong answer, because the
-question asked what was requested and the span says what was agreed.
-
-So there is a third check: the claim's predicate must be supported by the span.
-"CenterPoint requested" against a span saying "the signatories agreed" is a
-mismatch that no amount of quoting accuracy repairs. This is the weakest of the
-three and the one most likely to need revision -- it is a word-level test
-standing in for a semantic one -- but leaving it out means the guard verifies
-two things carefully and misses the failure that actually occurs.
+Predicate verification catches what neither can. Retrieval's top chunk for
+"what return on equity did CenterPoint request?" states the AGREED 9.4% rather
+than the requested 10.4%; a claim built on it quotes accurately and its figure
+is present. Three figures in this docket are one word apart.
 """
 
 from __future__ import annotations
@@ -42,9 +25,8 @@ from difflib import SequenceMatcher
 
 WORD_RE = re.compile(r"[A-Za-z]{2,}")
 
-# Same pattern the extraction-fidelity measurement uses. Parenthesised
-# negatives, currency, and percent are captured rather than discarded, because
-# each changes what a figure means.
+# Parenthesised negatives, currency and percent are captured rather than
+# discarded: each changes what a figure means.
 NUM_RE = re.compile(
     r"""
     (?P<open>\()?
@@ -57,19 +39,18 @@ NUM_RE = re.compile(
     re.VERBOSE,
 )
 
-# Below this similarity the quoted span is not a rendering difference, it is a
-# different passage. Measured word accuracy on the eligible corpus is 99.6-100%,
-# so a genuine quotation lands far above this and a fabricated one far below.
+# Below this the quoted span is a different passage, not a rendering difference.
+# Word accuracy on the eligible corpus is 99.6-100%.
 SPAN_SIMILARITY_FLOOR = 0.85
 
-# Predicates that assert different things about the same figure. A rate case
-# turns on these distinctions: requested, recommended, and approved are three
-# different numbers in this docket (10.4%, 9.45%, 9.4%), and a claim that swaps
-# them is wrong while quoting perfectly.
+# Requested, recommended and settled are three different numbers in this docket
+# -- 10.4%, 9.45%, 9.4% -- and a claim that swaps them is wrong while quoting
+# perfectly. "agreed" and "approved" are one group: the signatories agreed and
+# the Commission approved the same figure, and separating them refused the
+# clearest question in the eval set.
 CONTESTED_PREDICATES = {
     "requested": {"request", "requested", "sought", "proposed", "initially"},
     "recommended": {"recommend", "recommended", "recommendation", "proposal"},
-
     "settled": {
         "agreed", "agreement", "stipulated", "signatories", "settlement",
         "approved", "approves", "adopted", "ordered", "orders", "must",
@@ -103,13 +84,9 @@ class Verification:
 
 
 def canonical_numbers(text: str) -> list[str]:
-    """Canonical numeric tokens: signed value, percent preserved.
-
-    1,234 -> "1234"   (1,234) -> "-1234"   $1,234.50 -> "1234.5"   10.4% -> "10.4%"
-
-    A closing paren signs the value only if an opening one was captured too, so
-    "see line 5)" is not negative five.
-    """
+    # Canonical numeric tokens: signed value, percent preserved.
+    # 1,234 -> "1234"   (1,234) -> "-1234"   $1,234.50 -> "1234.5"   10.4% -> "10.4%"
+    
     tokens: list[str] = []
     for match in NUM_RE.finditer(text):
         raw = match["num"].replace(",", "")
@@ -124,13 +101,8 @@ def canonical_numbers(text: str) -> list[str]:
 
 
 def verify_span(quoted: str, chunk_text: str) -> tuple[bool, float]:
-    """Does the quoted span appear in the chunk, allowing for OCR damage?
-
-    Compared on normalised whitespace and case, then by best-matching window
-    rather than whole-text similarity: a 40-word quotation from a 2,000
-    character chunk would score low against the whole chunk however accurate it
-    is.
-    """
+    # Does the quoted span appear in the chunk, allowing for OCR damage?
+    
     needle = " ".join(quoted.split()).lower()
     haystack = " ".join(chunk_text.split()).lower()
     if not needle:
@@ -148,12 +120,8 @@ def verify_span(quoted: str, chunk_text: str) -> tuple[bool, float]:
 
 
 def verify_numbers(claim_text: str, quoted: str) -> tuple[bool, list[str]]:
-    """Is every figure the claim asserts present in the span it quotes?
-
-    Exact, because digits survive extraction here. Direction matters: a claim
-    may quote a span holding more figures than it uses, but it may not assert a
-    figure the span does not contain.
-    """
+    # Is every figure the claim asserts present in the span it quotes?
+    
     claimed = canonical_numbers(claim_text)
     available = canonical_numbers(quoted)
     missing = [n for n in claimed if n not in available]
@@ -163,27 +131,8 @@ def verify_numbers(claim_text: str, quoted: str) -> tuple[bool, list[str]]:
 def verify_predicate(
     claim_text: str, quoted: str, chunk_text: str | None = None
 ) -> tuple[bool, str | None]:
-    """Does the span support what the claim asserts about its figure?
-
-    The check that catches the failure the other two cannot. In this docket
-    "requested", "recommended" and "approved" name three different return-on-
-    equity figures, and retrieval's top result for a question about one of them
-    is often the page stating another. A claim asserting one predicate while
-    quoting a span that states a different one is wrong however exactly it
-    quotes.
-
-    Checked against the span first, then the CHUNK the span came from. A narrow
-    quotation often contains no predicate at all -- "a return on equity of 9.4%"
-    names none -- and checking only the span lets a claim dodge the check by
-    quoting tightly around the figure. The predicate is a property of the
-    passage, and the passage is the chunk; the figure is what must be in the
-    span.
-
-    Deliberately narrow otherwise: it fires only when the claim names a
-    contested predicate AND the source names a different one. An unmarked claim
-    passes, because most claims assert nothing of the kind and refusing them
-    would make the guard useless.
-    """
+    # Does the span support what the claim asserts about its figure?
+    
     claim_words = {w.lower() for w in WORD_RE.findall(claim_text)}
     span_words = {w.lower() for w in WORD_RE.findall(quoted)}
     if chunk_text and not any(
@@ -209,7 +158,7 @@ def verify_predicate(
 
 
 def verify_claim(claim_text: str, quoted: str, chunk_text: str) -> Verification:
-    """Run all three checks. A claim is verified only if all three pass."""
+    # Run all three checks. A claim is verified only if all three pass
     span_ok, similarity = verify_span(quoted, chunk_text)
     if not span_ok:
         # The other checks are meaningless against a span that is not in the
@@ -247,26 +196,8 @@ def verify_claim_over_units(
     claim_text: str,
     units: list[tuple[str, str]],
 ) -> Verification:
-    """Verify a claim whose evidence spans several units, possibly several chunks.
-
-    THIS EXISTS BECAUSE THE OBVIOUS COMPOSITION IS WRONG
-
-    Joining the units into one string and calling verify_claim on it asks
-    whether text that was never adjacent appears adjacently. It does not, so the
-    span check fails on evidence that is genuinely in the record -- and the span
-    check is the one that cannot legitimately fail, since units are verbatim by
-    construction.
-
-    That mistake was made three times, always while rewriting the script that
-    composes these calls, and never caught: the checks below are unit tested in
-    isolation, and the bug lives in how they are combined. So the combination
-    lives here now, where the tests can reach it.
-
-    `units` is (unit text, the text of the chunk it came from). Each unit is
-    checked against its OWN chunk. Numbers and predicate look at the joined
-    evidence, because they ask whether a figure or a word appears anywhere in
-    what was cited, not whether it appears contiguously.
-    """
+    # Verify a claim whose evidence spans several units, possibly several chunks.
+    
     if not units:
         return Verification(
             span_verified=False,

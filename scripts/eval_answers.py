@@ -1,58 +1,19 @@
 #!/usr/bin/env python3
 """Score the whole pipeline against the question set.
 
-eval_retrieval.py answers "can the right page be found". This answers "does the
-system say the right thing, or refuse when it should" -- which is the number the
-project exists to produce, and the first one that describes the system rather
-than a component.
+eval_retrieval.py asks whether the right page can be found. This asks whether
+the system says the right thing, or refuses when it should.
 
-FOUR OUTCOMES, AND ONLY ONE OF THEM IS SILENT
+Four outcomes, never summed: answered correctly, refused correctly, wrongly
+refused, wrongly answered. The last is the one this design exists to prevent --
+a refusal wastes a reader's time, a wrong answer hands them a figure they
+cannot check.
 
-    answered correctly   a verified claim carries the expected answer
-    refused correctly    a refusal question got a refusal
-    wrongly refused      the answer is in the corpus and the system declined
-    WRONGLY ANSWERED     a verified claim carries the wrong answer
-
-The last is the failure this design exists to prevent, and it is the only one
-that reaches a reader as a mistake rather than as an absence. A wrongly refused
-question wastes someone's time; a wrongly answered one gives them a plausible
-number they cannot distinguish from a correct one without doing the research
-themselves. They are counted separately for that reason, and never summed into
-a single accuracy figure that would hide the difference.
-
-MATCHING IS DETERMINISTIC, AND DEPENDS ON THE ANSWER MODE
-
-    ANSWER_SINGLE          one figure, checked by containment in the verified
-                           claims, after the guard's numeric normalisation --
-                           "$450" and "450" agree, "(450)" does not
-    ANSWER_QUALIFIED_SET   several figures, each of which must appear in the
-                           SAME claim as its qualifier
-    REFUSE_NO_SUPPORT      the corpus is silent
-    REFUSE_UNRESOLVABLE    the corpus holds values that conflict under the same
-                           qualifier, with nothing to choose between them
-
-The qualified-set mode exists because two questions were mislabelled as
-refusals. "What is the residential PBRAF?" has three answers across three
-schedules, and enumerating them with attribution resolves the ambiguity rather
-than guessing at it -- a better answer than declining. But a bare "64.9176%"
-with no schedule named is a bad answer to the same question, and joined-text
-containment scores both identically.
-
-So a qualified set is scored per CLAIM, not over the joined text. A claim
-pairing the right figures with the wrong schedules would satisfy every required
-substring while being exactly the misattribution this project exists to prevent.
-
-RESPONSES ARE CACHED
-
-Keyed on question, backend, and the ids offered. Re-running while tuning the
-guard should not pay for identical calls, and two runs that differ only in guard
-behaviour should differ only in guard behaviour -- an uncached run varies with
-the model's sampling even at temperature zero.
+Responses are cached under data/eval_cache, keyed on prompt and offered ids, so
+tuning the guard neither pays for identical calls nor varies with sampling.
 
 Usage:
-    python scripts/eval_answers.py --backend echo
     python scripts/eval_answers.py --backend anthropic --show-failures
-    python scripts/eval_answers.py --backend anthropic --no-cache
 """
 
 from __future__ import annotations
@@ -68,14 +29,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-import psycopg  # noqa: E402
+import psycopg  
 
-from puctqa.generate import BACKENDS  # noqa: E402
-from puctqa.guard import canonical_numbers  # noqa: E402
+from puctqa.generate import BACKENDS  
+from puctqa.guard import canonical_numbers  
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from answer import answer as run_answer  # noqa: E402
+from answer import answer as run_answer 
 
 DEFAULT_DSN = "postgresql://puctqa:puctqa@localhost:5432/puctqa"
 DEFAULT_EMBED_MODEL = "Qwen/Qwen3-Embedding-0.6B"
@@ -92,12 +53,8 @@ class Outcome:
 
 
 def cached_backend(backend, name: str, enabled: bool):
-    """Wrap a backend so identical requests are answered from disk.
+    # Wrap a backend so identical requests are answered from disk.
 
-    Keyed on the prompt and the ids offered, which together determine what the
-    model was asked. A guard change does not alter either, so two runs that
-    differ only in the guard differ only in the guard.
-    """
     if not enabled:
         return backend
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -117,12 +74,8 @@ def cached_backend(backend, name: str, enabled: bool):
 
 
 def qualified_matches(required: list[dict], claims: list[str]) -> tuple[int, int]:
-    """(matched, total) required (value, qualifier) pairs.
-
-    Each pair must be satisfied by ONE claim carrying both. Checking the joined
-    text would accept "Schedules SRC and 6.7.2 report 40.4859% and 64.9176%",
-    which contains every required substring with the values swapped.
-    """
+    # matched, total) required (value, qualifier) pairs
+    # Each pair must be satisfied by ONE claim carrying both
     matched = 0
     for item in required:
         wanted = canonical_numbers(item["value"])
@@ -138,13 +91,7 @@ def qualified_matches(required: list[dict], claims: list[str]) -> tuple[int, int
 
 
 def answer_matches(expected: str, claims: list[str]) -> bool:
-    """Does any verified claim carry the expected answer?
-
-    Figures are compared after the guard's normalisation, so "$450" and "450"
-    agree while "(450)" does not -- a parenthesised negative is a different
-    number, and this docket is full of them. Non-numeric expectations fall back
-    to case-insensitive containment.
-    """
+    # Does any verified claim carry the expected answer?
     text = " ".join(claims)
     wanted = canonical_numbers(expected)
     if wanted:
